@@ -1,17 +1,19 @@
 #include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <random>
-#include <sstream>
 #include <vector>
 
 #include <hostjit/jit_compiler.hpp>
 
 #ifdef _WIN32
-#  include <process.h>
+#  define WIN32_LEAN_AND_MEAN
+#  include <objbase.h>
+#  include <windows.h>
 #else
-#  include <unistd.h>
+#  include <stdlib.h>
 #endif
 
 namespace
@@ -131,16 +133,49 @@ hostjit::CompilerConfig prepare_pch_config(const hostjit::CompilerConfig& config
   return prepared;
 }
 
-bool read_file(const std::string& path, std::vector<char>& out)
+bool read_file(const std::filesystem::path& path, std::vector<char>& out)
 {
-  std::ifstream f(path, std::ios::binary);
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f)
   {
     return false;
   }
-  out.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-  return true;
+  auto size = f.tellg();
+  if (size < 0)
+  {
+    return false;
+  }
+
+  out.resize(static_cast<size_t>(size));
+  f.seekg(0);
+  if (!out.empty())
+  {
+    f.read(out.data(), static_cast<std::streamsize>(out.size()));
+  }
+  return static_cast<bool>(f);
 }
+
+#ifdef _WIN32
+std::string guid_to_string(const GUID& guid)
+{
+  char buffer[33]{};
+  std::snprintf(buffer,
+                sizeof(buffer),
+                "%08lx%04x%04x%02x%02x%02x%02x%02x%02x%02x%02x",
+                static_cast<unsigned long>(guid.Data1),
+                guid.Data2,
+                guid.Data3,
+                guid.Data4[0],
+                guid.Data4[1],
+                guid.Data4[2],
+                guid.Data4[3],
+                guid.Data4[4],
+                guid.Data4[5],
+                guid.Data4[6],
+                guid.Data4[7]);
+  return buffer;
+}
+#endif
 } // anonymous namespace
 
 namespace hostjit
@@ -163,7 +198,8 @@ bool JITCompiler::compile(const std::string& source_code)
   std::string config_error;
   if (!validateConfig(config_, &config_error))
   {
-    last_error_ = "Configuration error: " + config_error;
+    last_error_      = "Configuration error: " + config_error;
+    last_error_code_ = std::make_error_code(std::errc::invalid_argument);
     return false;
   }
 
@@ -172,7 +208,8 @@ bool JITCompiler::compile(const std::string& source_code)
   temp_dir_ = createTempDirectory();
   if (temp_dir_.empty())
   {
-    last_error_ = "Failed to create temporary directory";
+    last_error_      = "Failed to create temporary directory";
+    last_error_code_ = std::make_error_code(std::errc::io_error);
     return false;
   }
 
@@ -191,24 +228,28 @@ bool JITCompiler::compile(const std::string& source_code)
   auto create_result = libnvccCreateProgram(&program.program, source_code.c_str(), "input.cu");
   if (create_result != LIBNVCC_SUCCESS)
   {
-    last_error_ = std::string("Failed to create libnvcc program: ") + libnvccGetErrorString(create_result);
+    last_error_      = std::string("Failed to create libnvcc program: ") + libnvccGetErrorString(create_result);
+    last_error_code_ = std::make_error_code(std::errc::io_error);
     removeTempDirectory();
     return false;
   }
 
-  std::string obj_path   = temp_dir_ + "/cuda_code.o";
-  std::string cubin_path = temp_dir_ + "/device.cubin";
+  std::filesystem::path obj_path   = temp_dir_ / "cuda_code.o";
+  std::filesystem::path cubin_path = temp_dir_ / "device.cubin";
+  std::string obj_path_string      = obj_path.string();
+  std::string cubin_path_string    = cubin_path.string();
   auto compile_result    = libnvccCompileProgramToObject(
     program.program,
-    obj_path.c_str(),
-    cubin_path.c_str(),
+    obj_path_string.c_str(),
+    cubin_path_string.c_str(),
     static_cast<int>(option_ptrs.size()),
     option_ptrs.empty() ? nullptr : option_ptrs.data());
   auto compile_log = hostjit::detail::get_libnvcc_program_log(program.program);
 
   if (compile_result != LIBNVCC_SUCCESS)
   {
-    last_error_ = "Compilation failed:\n" + compile_log;
+    last_error_      = "Compilation failed:\n" + compile_log;
+    last_error_code_ = std::make_error_code(std::errc::io_error);
     removeTempDirectory();
     return false;
   }
@@ -216,7 +257,8 @@ bool JITCompiler::compile(const std::string& source_code)
   cubin_.clear();
   if (!read_file(cubin_path, cubin_))
   {
-    last_error_ = "Compilation failed: generated cubin could not be read";
+    last_error_      = "Compilation failed: generated cubin could not be read";
+    last_error_code_ = std::make_error_code(std::errc::io_error);
     removeTempDirectory();
     return false;
   }
@@ -227,23 +269,25 @@ bool JITCompiler::compile(const std::string& source_code)
   }
 
 #ifdef _WIN32
-  std::string lib_path = temp_dir_ + "/cuda_code.dll";
+  std::filesystem::path lib_path = temp_dir_ / "cuda_code.dll";
 #else
-  std::string lib_path = temp_dir_ + "/libcuda_code.so";
+  std::filesystem::path lib_path = temp_dir_ / "libcuda_code.so";
 #endif
-  const char* object_files[] = {obj_path.c_str()};
+  std::string lib_path_string = lib_path.string();
+  const char* object_files[]  = {obj_path_string.c_str()};
   auto link_result           = libnvccLinkToSharedLibrary(
     program.program,
     1,
     object_files,
-    lib_path.c_str(),
+    lib_path_string.c_str(),
     static_cast<int>(option_ptrs.size()),
     option_ptrs.empty() ? nullptr : option_ptrs.data());
   auto link_log = hostjit::detail::get_libnvcc_program_log(program.program);
 
   if (link_result != LIBNVCC_SUCCESS)
   {
-    last_error_ = "Linking failed:\n" + link_log;
+    last_error_      = "Linking failed:\n" + link_log;
+    last_error_code_ = std::make_error_code(std::errc::io_error);
     removeTempDirectory();
     return false;
   }
@@ -253,19 +297,21 @@ bool JITCompiler::compile(const std::string& source_code)
     std::cout << "Linking diagnostics:\n" << link_log << "\n";
   }
 
-  if (!library_.load(lib_path))
+  if (!library_.load(lib_path_string))
   {
-    last_error_ = "Failed to load library: " + library_.getLastError();
+    last_error_      = "Failed to load library: " + library_.getLastError();
+    last_error_code_ = library_.getLastErrorCode();
     removeTempDirectory();
     return false;
   }
 
   if (config_.verbose)
   {
-    std::cout << "Successfully loaded library: " << lib_path << "\n";
+    std::cout << "Successfully loaded library: " << lib_path_string << "\n";
   }
 
   last_error_.clear();
+  last_error_code_.clear();
   return true;
 }
 
@@ -279,61 +325,47 @@ void JITCompiler::cleanup()
   }
 
   last_error_.clear();
+  last_error_code_.clear();
 }
 
-std::string JITCompiler::createTempDirectory()
+std::filesystem::path JITCompiler::createTempDirectory()
 {
-  std::filesystem::path base_tmp_dir;
-
 #ifdef _WIN32
-  const char* tmp_dir = std::getenv("TEMP");
-  if (!tmp_dir)
+  char temp_path[MAX_PATH + 1]{};
+  DWORD len = GetTempPathA(static_cast<DWORD>(sizeof(temp_path)), temp_path);
+  if (len == 0 || len > MAX_PATH)
   {
-    tmp_dir = std::getenv("TMP");
+    return {};
   }
-  if (tmp_dir)
+
+  GUID guid;
+  if (CoCreateGuid(&guid) != S_OK)
   {
-    base_tmp_dir = tmp_dir;
+    return {};
   }
-  else
+  std::filesystem::path full_path = std::filesystem::path(temp_path) / ("hostjit_" + guid_to_string(guid));
+  if (!CreateDirectoryA(full_path.string().c_str(), nullptr))
   {
-    base_tmp_dir = std::filesystem::temp_directory_path();
+    return {};
   }
+  return full_path;
 #else
-  const char* tmp_dir = std::getenv("TMPDIR");
-  if (tmp_dir)
-  {
-    base_tmp_dir = tmp_dir;
-  }
-  else
+  std::error_code ec;
+  std::filesystem::path base_tmp_dir = std::filesystem::temp_directory_path(ec);
+  if (ec)
   {
     base_tmp_dir = "/tmp";
   }
-#endif
 
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_int_distribution<> dis(0, 999999);
-
-#ifdef _WIN32
-  int pid = _getpid();
-#else
-  int pid = getpid();
-#endif
-
-  for (int attempt = 0; attempt < 10; ++attempt)
+  std::string path_template = (base_tmp_dir / "hostjit_XXXXXX").string();
+  char* created = mkdtemp(path_template.data());
+  if (!created)
   {
-    std::string dir_name            = "hostjit_" + std::to_string(pid) + "_" + std::to_string(dis(gen));
-    std::filesystem::path full_path = base_tmp_dir / dir_name;
-
-    std::error_code ec;
-    if (std::filesystem::create_directories(full_path, ec) && !ec)
-    {
-      return full_path.string();
-    }
+    return {};
   }
 
-  return "";
+  return std::filesystem::path(created);
+#endif
 }
 
 void JITCompiler::removeTempDirectory()
@@ -343,19 +375,11 @@ void JITCompiler::removeTempDirectory()
     return;
   }
 
-  try
+  std::error_code ec;
+  std::filesystem::remove_all(temp_dir_, ec);
+  if (ec && config_.verbose)
   {
-    if (std::filesystem::exists(temp_dir_))
-    {
-      std::filesystem::remove_all(temp_dir_);
-    }
-  }
-  catch (const std::filesystem::filesystem_error& e)
-  {
-    if (config_.verbose)
-    {
-      std::cerr << "Warning: Failed to remove temporary directory: " << e.what() << "\n";
-    }
+    std::cerr << "Warning: Failed to remove temporary directory: " << ec.message() << "\n";
   }
 
   temp_dir_.clear();

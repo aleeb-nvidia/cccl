@@ -1,7 +1,11 @@
 #pragma once
 
+#include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
+#include <system_error>
+#include <vector>
 
 #include <hostjit/compiler.hpp>
 #include <hostjit/config.hpp>
@@ -35,14 +39,16 @@ public:
   {
     if (!library_.isLoaded())
     {
-      last_error_ = "No library loaded";
+      last_error_      = "No library loaded";
+      last_error_code_ = std::make_error_code(std::errc::bad_file_descriptor);
       return nullptr;
     }
 
-    auto func = library_.getFunction<FuncType>(name);
+    auto func = library_.getSymbolAs<FuncType>(name);
     if (!func)
     {
-      last_error_ = "Failed to find function '" + name + "': " + library_.getLastError();
+      last_error_      = "Failed to find function '" + name + "': " + library_.getLastError();
+      last_error_code_ = library_.getLastErrorCode();
     }
     return func;
   }
@@ -51,6 +57,11 @@ public:
   std::string getLastError() const
   {
     return last_error_;
+  }
+
+  std::error_code getLastErrorCode() const
+  {
+    return last_error_code_;
   }
 
   // Get the configuration being used
@@ -69,26 +80,28 @@ public:
   // Only valid after successful compile() and if keep_artifacts is set
   std::string getArtifactsPath() const
   {
-    return temp_dir_;
+    return temp_dir_.string();
   }
 
-  // Get the cubin extracted during compilation
-  const std::vector<char>& getCubin() const
+  // Get the cubin extracted during compilation. The view is valid until the
+  // next compile() call or until this compiler is destroyed.
+  std::span<const char> getCubin() const
   {
-    return cubin_;
+    return {cubin_.data(), cubin_.size()};
   }
 
   // Unload the current library and clean up temporary files
   void cleanup();
 
 private:
-  std::string createTempDirectory();
+  std::filesystem::path createTempDirectory();
   void removeTempDirectory();
 
   CompilerConfig config_;
   DynamicLibrary library_;
-  std::string temp_dir_;
+  std::filesystem::path temp_dir_;
   std::string last_error_;
+  std::error_code last_error_code_;
   std::vector<char> cubin_;
 };
 } // namespace hostjit

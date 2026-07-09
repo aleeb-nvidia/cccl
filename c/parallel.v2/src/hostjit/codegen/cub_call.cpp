@@ -658,7 +658,8 @@ CubCallResult CubCall::compile(
   }
 
   // 6. Copy cubin
-  auto cubin = compiler->getCubin();
+  auto cubin_view = compiler->getCubin();
+  std::vector<char> cubin(cubin_view.begin(), cubin_view.end());
 
   return CubCallResult{compiler.release(), reinterpret_cast<void*>(fn), std::move(cubin)};
 }
@@ -806,7 +807,8 @@ MultiCubCallResult CubCall::compile(
     fn_ptrs.push_back(reinterpret_cast<void*>(fn));
   }
 
-  auto cubin = compiler->getCubin();
+  auto cubin_view = compiler->getCubin();
+  std::vector<char> cubin(cubin_view.begin(), cubin_view.end());
   return MultiCubCallResult{compiler.release(), std::move(cubin), std::move(fn_ptrs)};
 }
 } // namespace hostjit::codegen

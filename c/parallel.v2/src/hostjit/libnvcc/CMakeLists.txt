@@ -27,7 +27,7 @@ set(LIBNVCC_LLVM_VERSION "${_libnvcc_llvm_version_default}" CACHE STRING "LLVM g
 
 # List options must be set before CPMAddPackage
 set(LLVM_ENABLE_PROJECTS "clang;lld" CACHE STRING "" FORCE)
-set(LLVM_TARGETS_TO_BUILD "X86;NVPTX" CACHE STRING "" FORCE)
+set(LLVM_TARGETS_TO_BUILD "X86;AArch64;NVPTX" CACHE STRING "" FORCE)
 
 CPMAddPackage(
   NAME llvm_project
@@ -122,6 +122,10 @@ target_link_libraries(
     LLVMX86AsmParser
     LLVMX86Desc
     LLVMX86Info
+    LLVMAArch64CodeGen
+    LLVMAArch64AsmParser
+    LLVMAArch64Desc
+    LLVMAArch64Info
     LLVMNVPTXCodeGen
     LLVMNVPTXDesc
     LLVMNVPTXInfo

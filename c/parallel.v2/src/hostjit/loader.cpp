@@ -1,5 +1,8 @@
 #include <hostjit/loader.hpp>
 
+#include <cstring>
+#include <utility>
+
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -9,9 +12,50 @@
 
 namespace hostjit
 {
-#ifdef _WIN32
 namespace
 {
+enum class dynamic_library_errc
+{
+  not_loaded = 1,
+  load_failed,
+  symbol_not_found
+};
+
+class DynamicLibraryErrorCategory : public std::error_category
+{
+public:
+  const char* name() const noexcept override
+  {
+    return "hostjit.dynamic_library";
+  }
+
+  std::string message(int ev) const override
+  {
+    switch (static_cast<dynamic_library_errc>(ev))
+    {
+      case dynamic_library_errc::not_loaded:
+        return "library not loaded";
+      case dynamic_library_errc::load_failed:
+        return "library load failed";
+      case dynamic_library_errc::symbol_not_found:
+        return "symbol lookup failed";
+    }
+    return "unknown dynamic library error";
+  }
+};
+
+const std::error_category& dynamic_library_category()
+{
+  static const DynamicLibraryErrorCategory category;
+  return category;
+}
+
+std::error_code make_error_code(dynamic_library_errc errc)
+{
+  return {static_cast<int>(errc), dynamic_library_category()};
+}
+
+#ifdef _WIN32
 // Run C++ static constructors in a DLL loaded with /NOENTRY /NODEFAULTLIB.
 // The compiler places CUDA fatbin registration in the .CRT$XCU section.
 // Without CRT startup, these never run, so we walk the merged .CRT section
@@ -40,44 +84,8 @@ void runStaticInitializers(HMODULE module)
     }
   }
 }
-
-std::string getWindowsError()
-{
-  DWORD error = GetLastError();
-  if (error == 0)
-  {
-    return "";
-  }
-
-  LPSTR buffer = nullptr;
-  DWORD size   = FormatMessageA(
-    FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-    nullptr,
-    error,
-    MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-    reinterpret_cast<LPSTR>(&buffer),
-    0,
-    nullptr);
-
-  std::string message;
-  if (size > 0 && buffer)
-  {
-    message = std::string(buffer, size);
-    while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
-    {
-      message.pop_back();
-    }
-    LocalFree(buffer);
-  }
-  else
-  {
-    message = "Unknown error (code: " + std::to_string(error) + ")";
-  }
-
-  return message;
-}
-} // anonymous namespace
 #endif
+} // anonymous namespace
 
 DynamicLibrary::DynamicLibrary()
     : handle_(nullptr)
@@ -91,6 +99,7 @@ DynamicLibrary::~DynamicLibrary()
 DynamicLibrary::DynamicLibrary(DynamicLibrary&& other) noexcept
     : handle_(other.handle_)
     , last_error_(std::move(other.last_error_))
+    , last_error_code_(std::move(other.last_error_code_))
 {
   other.handle_ = nullptr;
 }
@@ -100,9 +109,10 @@ DynamicLibrary& DynamicLibrary::operator=(DynamicLibrary&& other) noexcept
   if (this != &other)
   {
     unload();
-    handle_       = other.handle_;
-    last_error_   = std::move(other.last_error_);
-    other.handle_ = nullptr;
+    handle_           = other.handle_;
+    last_error_       = std::move(other.last_error_);
+    last_error_code_  = std::move(other.last_error_code_);
+    other.handle_     = nullptr;
   }
   return *this;
 }
@@ -117,10 +127,16 @@ bool DynamicLibrary::load(const std::string& library_path)
 
   if (!handle_)
   {
-    last_error_ = getWindowsError();
-    if (last_error_.empty())
+    DWORD error = GetLastError();
+    if (error != 0)
+    {
+      last_error_code_ = std::error_code(static_cast<int>(error), std::system_category());
+      last_error_      = last_error_code_.message();
+    }
+    else
     {
       last_error_ = "Unknown LoadLibrary error";
+      last_error_code_ = make_error_code(dynamic_library_errc::load_failed);
     }
     return false;
   }
@@ -136,11 +152,13 @@ bool DynamicLibrary::load(const std::string& library_path)
   {
     const char* error = dlerror();
     last_error_       = error ? error : "Unknown dlopen error";
+    last_error_code_  = make_error_code(dynamic_library_errc::load_failed);
     return false;
   }
 #endif
 
   last_error_.clear();
+  last_error_code_.clear();
   return true;
 }
 
@@ -148,7 +166,8 @@ void* DynamicLibrary::getSymbol(const std::string& symbol_name)
 {
   if (!handle_)
   {
-    last_error_ = "Library not loaded";
+    last_error_      = "Library not loaded";
+    last_error_code_ = make_error_code(dynamic_library_errc::not_loaded);
     return nullptr;
   }
 
@@ -158,10 +177,16 @@ void* DynamicLibrary::getSymbol(const std::string& symbol_name)
 
   if (!symbol)
   {
-    last_error_ = getWindowsError();
-    if (last_error_.empty())
+    DWORD error = GetLastError();
+    if (error != 0)
+    {
+      last_error_code_ = std::error_code(static_cast<int>(error), std::system_category());
+      last_error_      = last_error_code_.message();
+    }
+    else
     {
       last_error_ = "Symbol not found: " + symbol_name;
+      last_error_code_ = make_error_code(dynamic_library_errc::symbol_not_found);
     }
     return nullptr;
   }
@@ -172,12 +197,14 @@ void* DynamicLibrary::getSymbol(const std::string& symbol_name)
   const char* error = dlerror();
   if (error)
   {
-    last_error_ = error;
+    last_error_      = error;
+    last_error_code_ = make_error_code(dynamic_library_errc::symbol_not_found);
     return nullptr;
   }
 #endif
 
   last_error_.clear();
+  last_error_code_.clear();
   return symbol;
 }
 
@@ -189,6 +216,11 @@ bool DynamicLibrary::isLoaded() const
 std::string DynamicLibrary::getLastError() const
 {
   return last_error_;
+}
+
+std::error_code DynamicLibrary::getLastErrorCode() const
+{
+  return last_error_code_;
 }
 
 void DynamicLibrary::unload()
@@ -206,5 +238,6 @@ void DynamicLibrary::unload()
     handle_ = nullptr;
   }
   last_error_.clear();
+  last_error_code_.clear();
 }
 } // namespace hostjit

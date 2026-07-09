@@ -69,6 +69,8 @@ endif()
 
 if (NOT WIN32)
   target_link_libraries(cccl.c.parallel.v2.hostjit_lib PUBLIC dl)
+else()
+  target_link_libraries(cccl.c.parallel.v2.hostjit_lib PRIVATE ole32)
 endif()
 
 target_link_libraries(

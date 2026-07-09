@@ -22,18 +22,14 @@
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/VirtualFileSystem.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/Host.h>
 
-// Selective target initialization (X86 for host, NVPTX for device)
+// Selective target initialization (native host target plus NVPTX for device)
 extern "C" {
-void LLVMInitializeX86TargetInfo();
-void LLVMInitializeX86Target();
-void LLVMInitializeX86TargetMC();
-void LLVMInitializeX86AsmPrinter();
-void LLVMInitializeX86AsmParser();
 void LLVMInitializeNVPTXTargetInfo();
 void LLVMInitializeNVPTXTarget();
 void LLVMInitializeNVPTXTargetMC();
@@ -77,11 +73,9 @@ static void initialize_llvm()
     return;
   }
 
-  LLVMInitializeX86TargetInfo();
-  LLVMInitializeX86Target();
-  LLVMInitializeX86TargetMC();
-  LLVMInitializeX86AsmPrinter();
-  LLVMInitializeX86AsmParser();
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
   LLVMInitializeNVPTXTargetInfo();
   LLVMInitializeNVPTXTarget();
   LLVMInitializeNVPTXTargetMC();
@@ -118,12 +112,22 @@ struct CompilationResult
   bool success = false;
   std::string object_file_path;
   std::string diagnostics;
+
+  explicit operator bool() const
+  {
+    return success;
+  }
 };
 
 struct BitcodeResult
 {
   bool success = false;
   std::string diagnostics;
+
+  explicit operator bool() const
+  {
+    return success;
+  }
 };
 
 struct LinkResult
@@ -131,6 +135,11 @@ struct LinkResult
   bool success = false;
   std::string library_path;
   std::string diagnostics;
+
+  explicit operator bool() const
+  {
+    return success;
+  }
 };
 
 static bool pathExists(const std::filesystem::path& path);
@@ -191,6 +200,21 @@ static void setDefaultOptions(CompilerOptions& options)
     options.clang_headers_path = CLANG_HEADERS_DIR;
   }
 #endif
+}
+
+static std::string getHostTargetTriple()
+{
+  return llvm::sys::getDefaultTargetTriple();
+}
+
+static std::string getHostCPUName()
+{
+  auto cpu = llvm::sys::getHostCPUName();
+  if (cpu.empty())
+  {
+    return "generic";
+  }
+  return cpu.str();
 }
 
 static bool pathExists(const std::filesystem::path& path)
@@ -853,14 +877,10 @@ public:
     arg_strings.push_back("-triple");
     arg_strings.push_back("nvptx64-nvidia-cuda");
     arg_strings.push_back("-aux-triple");
-#ifdef _WIN32
-    arg_strings.push_back("x86_64-pc-windows-msvc");
-#else
-    arg_strings.push_back("x86_64-pc-linux-gnu");
-#endif
+    arg_strings.push_back(getHostTargetTriple());
     arg_strings.push_back("-S");
     arg_strings.push_back("-aux-target-cpu");
-    arg_strings.push_back("x86-64");
+    arg_strings.push_back(getHostCPUName());
     arg_strings.push_back("-fcuda-is-device");
     arg_strings.push_back("-fcuda-allow-variadic-functions");
 #ifdef _WIN32
@@ -1210,7 +1230,6 @@ public:
     const CompilerOptions& config)
   {
     BitcodeResult result;
-    result.success = false;
 
     std::string error_msg;
     if (!validateOptions(config, &error_msg))
@@ -1254,14 +1273,10 @@ public:
     arg_strings.push_back("-triple");
     arg_strings.push_back("nvptx64-nvidia-cuda");
     arg_strings.push_back("-aux-triple");
-#ifdef _WIN32
-    arg_strings.push_back("x86_64-pc-windows-msvc");
-#else
-    arg_strings.push_back("x86_64-pc-linux-gnu");
-#endif
+    arg_strings.push_back(getHostTargetTriple());
     arg_strings.push_back("-S");
     arg_strings.push_back("-aux-target-cpu");
-    arg_strings.push_back("x86-64");
+    arg_strings.push_back(getHostCPUName());
     arg_strings.push_back("-fcuda-is-device");
     arg_strings.push_back("-fcuda-allow-variadic-functions");
 #ifdef _WIN32
@@ -1403,17 +1418,13 @@ public:
     std::vector<std::string> arg_strings;
     arg_strings.push_back(source_file);
     arg_strings.push_back("-triple");
-#ifdef _WIN32
-    arg_strings.push_back("x86_64-pc-windows-msvc");
-#else
-    arg_strings.push_back("x86_64-pc-linux-gnu");
-#endif
+    arg_strings.push_back(getHostTargetTriple());
     arg_strings.push_back("-aux-triple");
     arg_strings.push_back("nvptx64-nvidia-cuda");
     arg_strings.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
     arg_strings.push_back("-emit-obj");
     arg_strings.push_back("-target-cpu");
-    arg_strings.push_back("x86-64");
+    arg_strings.push_back(getHostCPUName());
     arg_strings.push_back("-fcuda-allow-variadic-functions");
 #ifdef _WIN32
     arg_strings.push_back("-fms-compatibility");
@@ -1845,14 +1856,10 @@ public:
       arg_strings.push_back("-triple");
       arg_strings.push_back("nvptx64-nvidia-cuda");
       arg_strings.push_back("-aux-triple");
-#ifdef _WIN32
-      arg_strings.push_back("x86_64-pc-windows-msvc");
-#else
-      arg_strings.push_back("x86_64-pc-linux-gnu");
-#endif
+      arg_strings.push_back(getHostTargetTriple());
       arg_strings.push_back("-S");
       arg_strings.push_back("-aux-target-cpu");
-      arg_strings.push_back("x86-64");
+      arg_strings.push_back(getHostCPUName());
       arg_strings.push_back("-fcuda-is-device");
       arg_strings.push_back("-fcuda-allow-variadic-functions");
 #ifdef _WIN32
@@ -1872,17 +1879,13 @@ public:
     else if (kind == LIBNVCC_PCH_HOST)
     {
       arg_strings.push_back("-triple");
-#ifdef _WIN32
-      arg_strings.push_back("x86_64-pc-windows-msvc");
-#else
-      arg_strings.push_back("x86_64-pc-linux-gnu");
-#endif
+      arg_strings.push_back(getHostTargetTriple());
       arg_strings.push_back("-aux-triple");
       arg_strings.push_back("nvptx64-nvidia-cuda");
       arg_strings.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
       arg_strings.push_back("-emit-obj");
       arg_strings.push_back("-target-cpu");
-      arg_strings.push_back("x86-64");
+      arg_strings.push_back(getHostCPUName());
       arg_strings.push_back("-fcuda-allow-variadic-functions");
 #ifdef _WIN32
       arg_strings.push_back("-fms-compatibility");
@@ -2099,8 +2102,6 @@ public:
     arg_strings.push_back("-shared");
     arg_strings.push_back("--build-id");
     arg_strings.push_back("--eh-frame-hdr");
-    arg_strings.push_back("-m");
-    arg_strings.push_back("elf_x86_64");
     // Allow unresolved symbols — they will be satisfied at dlopen() time
     // by libraries already loaded in the host process (libc, libstdc++,
     // cudart, etc.).  This removes the need for system CRT objects and
