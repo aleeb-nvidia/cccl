@@ -9,6 +9,7 @@
 #include <clang/Lex/PreprocessorOptions.h>
 #include <libnvcc/libnvcc.h>
 #include <lld/Common/Driver.h>
+#include <llvm/ADT/ScopeExit.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/LLVMContext.h>
@@ -1306,6 +1307,9 @@ public:
     {
       return result;
     }
+    auto cleanup_temp_dir = llvm::scope_exit([&] {
+      removeAll(temp_dir);
+    });
 
     std::string input_file   = input_name.empty() ? std::string("input.cu") : input_name;
     std::string source_file  = temp_dir + "/" + input_file;
@@ -1336,7 +1340,6 @@ public:
     {
       diag_stream.flush();
       result.diagnostics = diag_output + "\nFailed to create compiler invocation";
-      removeAll(temp_dir);
       return result;
     }
 
@@ -1387,9 +1390,9 @@ public:
 
     diag_stream.flush();
     result.diagnostics += diag_output;
-    if (!config.keep_artifacts)
+    if (config.keep_artifacts)
     {
-      removeAll(temp_dir);
+      cleanup_temp_dir.release();
     }
     return result;
   }
@@ -1520,6 +1523,9 @@ public:
     {
       return result;
     }
+    auto cleanup_temp_dir = llvm::scope_exit([&] {
+      removeAll(temp_dir);
+    });
 
     std::string input_file  = input_name.empty() ? std::string("input.cu") : input_name;
     std::string ptx_file    = temp_dir + "/device.ptx";
@@ -1533,7 +1539,6 @@ public:
     if (!compileDeviceToPTX(source_code, input_file, ptx_file, config, result.diagnostics))
     {
       result.diagnostics += "\nDevice compilation failed";
-      removeAll(temp_dir);
       return result;
     }
 
@@ -1551,7 +1556,6 @@ public:
       if (ptx_data.empty())
       {
         result.diagnostics += "\nFailed to read ptx file";
-        removeAll(temp_dir);
         return result;
       }
       if (ptx_data.back() != '\0')
@@ -1587,9 +1591,11 @@ public:
         {
           result.diagnostics += " " + option;
         }
-        removeAll(temp_dir);
         return result;
       }
+      auto destroy_jitlink_handle = llvm::scope_exit([&] {
+        nvJitLinkDestroy(&jitlink_handle);
+      });
 
       jlr = nvJitLinkAddData(jitlink_handle, NVJITLINK_INPUT_PTX, ptx_data.data(), ptx_data.size(), "device.ptx");
       if (jlr != NVJITLINK_SUCCESS)
@@ -1603,8 +1609,6 @@ public:
           result.diagnostics += "\n" + log;
         }
         result.diagnostics += "\nnvJitLinkAddData failed";
-        nvJitLinkDestroy(&jitlink_handle);
-        removeAll(temp_dir);
         return result;
       }
 
@@ -1633,8 +1637,6 @@ public:
             result.diagnostics += "\n" + log;
           }
           result.diagnostics += "\nnvJitLinkAddData(LTOIR) failed for " + ltoir_path;
-          nvJitLinkDestroy(&jitlink_handle);
-          removeAll(temp_dir);
           return result;
         }
       }
@@ -1651,8 +1653,6 @@ public:
           result.diagnostics += "\n" + log;
         }
         result.diagnostics += "\nnvJitLinkComplete failed";
-        nvJitLinkDestroy(&jitlink_handle);
-        removeAll(temp_dir);
         return result;
       }
 
@@ -1660,7 +1660,6 @@ public:
       nvJitLinkGetLinkedCubinSize(jitlink_handle, &cubin_size);
       std::vector<char> cubin_data(cubin_size);
       nvJitLinkGetLinkedCubin(jitlink_handle, cubin_data.data());
-      nvJitLinkDestroy(&jitlink_handle);
 
       if (!output_cubin_path.empty())
       {
@@ -1670,7 +1669,6 @@ public:
               result.diagnostics,
               "\nFailed to write cubin file"))
         {
-          removeAll(temp_dir);
           return result;
         }
       }
@@ -1682,16 +1680,16 @@ public:
       if (fbr != NVFATBIN_SUCCESS)
       {
         result.diagnostics += std::string("\nnvFatbinCreate failed: ") + nvFatbinGetErrorString(fbr);
-        removeAll(temp_dir);
         return result;
       }
+      auto destroy_fatbin_handle = llvm::scope_exit([&] {
+        nvFatbinDestroy(&fatbin_handle);
+      });
 
       fbr = nvFatbinAddCubin(fatbin_handle, cubin_data.data(), cubin_data.size(), arch.c_str(), "device.cubin");
       if (fbr != NVFATBIN_SUCCESS)
       {
         result.diagnostics += std::string("\nnvFatbinAddCubin failed: ") + nvFatbinGetErrorString(fbr);
-        nvFatbinDestroy(&fatbin_handle);
-        removeAll(temp_dir);
         return result;
       }
 
@@ -1699,8 +1697,6 @@ public:
       if (fbr != NVFATBIN_SUCCESS)
       {
         result.diagnostics += std::string("\nnvFatbinAddPTX failed: ") + nvFatbinGetErrorString(fbr);
-        nvFatbinDestroy(&fatbin_handle);
-        removeAll(temp_dir);
         return result;
       }
 
@@ -1709,18 +1705,14 @@ public:
       if (fbr != NVFATBIN_SUCCESS)
       {
         result.diagnostics += std::string("\nnvFatbinSize failed: ") + nvFatbinGetErrorString(fbr);
-        nvFatbinDestroy(&fatbin_handle);
-        removeAll(temp_dir);
         return result;
       }
 
       std::vector<char> fatbin_data(fatbin_size);
       fbr = nvFatbinGet(fatbin_handle, fatbin_data.data());
-      nvFatbinDestroy(&fatbin_handle);
       if (fbr != NVFATBIN_SUCCESS)
       {
         result.diagnostics += std::string("\nnvFatbinGet failed: ") + nvFatbinGetErrorString(fbr);
-        removeAll(temp_dir);
         return result;
       }
 
@@ -1730,7 +1722,6 @@ public:
             result.diagnostics,
             "\nFailed to write fatbin file"))
       {
-        removeAll(temp_dir);
         return result;
       }
     }
@@ -1743,13 +1734,12 @@ public:
     if (!compileHostCode(source_code, input_file, fatbin_file, output_path, config, result.diagnostics))
     {
       result.diagnostics += "\nHost compilation failed";
-      removeAll(temp_dir);
       return result;
     }
 
-    if (!config.keep_artifacts)
+    if (config.keep_artifacts)
     {
-      removeAll(temp_dir);
+      cleanup_temp_dir.release();
     }
     result.success = true;
     return result;
