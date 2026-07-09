@@ -723,6 +723,118 @@ static void appendMacroDefinitions(std::vector<std::string>& args, const Compile
   }
 }
 
+// PTX version floor is 7.8. Some generated device code uses features added in
+// PTX 7.6 (e.g. `bmsk`), so older versions can fail to assemble even on sm_75/sm_80.
+static int ptxVersionForSM(int sm_version)
+{
+  if (sm_version >= 120)
+  {
+    return 87;
+  }
+  if (sm_version >= 100)
+  {
+    return 85;
+  }
+  if (sm_version >= 90)
+  {
+    return 80;
+  }
+  return 78;
+}
+
+static void appendCommonClangArgs(
+  std::vector<std::string>& args, const CompilerOptions& config, bool is_device)
+{
+  if (is_device)
+  {
+    const int ptx_version = ptxVersionForSM(config.sm_version);
+
+    args.push_back("-triple");
+    args.push_back("nvptx64-nvidia-cuda");
+    args.push_back("-aux-triple");
+    args.push_back(getHostTargetTriple());
+    args.push_back("-S");
+    args.push_back("-aux-target-cpu");
+    args.push_back(getHostCPUName());
+    args.push_back("-fcuda-is-device");
+    args.push_back("-fcuda-allow-variadic-functions");
+    args.push_back("-mlink-builtin-bitcode");
+    args.push_back(config.cuda_toolkit_path + "/nvvm/libdevice/libdevice.10.bc");
+    args.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
+    args.push_back("-target-cpu");
+    args.push_back("sm_" + std::to_string(config.sm_version));
+    args.push_back("-target-feature");
+    args.push_back("+ptx" + std::to_string(ptx_version));
+  }
+  else
+  {
+    args.push_back("-triple");
+    args.push_back(getHostTargetTriple());
+    args.push_back("-aux-triple");
+    args.push_back("nvptx64-nvidia-cuda");
+    args.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
+    args.push_back("-emit-obj");
+    args.push_back("-target-cpu");
+    args.push_back(getHostCPUName());
+    args.push_back("-fcuda-allow-variadic-functions");
+#ifdef _WIN32
+    // We do not have access to the windows CRT, but we are only running single threaded anyway.
+    // Otherwise we have undefined symbols like _tls_index and _Init_thread_epoch.
+    args.push_back("-fno-threadsafe-statics");
+#endif
+    args.push_back("-mrelocation-model");
+    args.push_back("pic");
+    args.push_back("-pic-level");
+    args.push_back("2");
+  }
+
+#ifdef _WIN32
+    args.push_back("-fms-compatibility");
+    args.push_back("-fms-compatibility-version=19.40");
+#else
+    args.push_back("-fgnuc-version=4.2.1");
+#endif
+
+  args.push_back("-resource-dir");
+  args.push_back(CLANG_RESOURCE_DIR);
+  args.push_back("-internal-isystem");
+  args.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/stubs");
+  args.push_back("-internal-isystem");
+  args.push_back(config.clang_headers_path.empty() ? std::string(CLANG_HEADERS_DIR) : config.clang_headers_path);
+  appendSystemIncludePaths(args, config);
+  args.push_back("-internal-isystem");
+  args.push_back(config.cuda_toolkit_path + "/include");
+  args.push_back("-include");
+  args.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/__clang_cuda_runtime_wrapper.h");
+
+  appendIncludePaths(args, config);
+
+  if (is_device)
+  {
+    args.push_back("-D__HOSTJIT_DEVICE_COMPILATION__=1");
+  }
+  args.push_back("-DNDEBUG");
+
+  appendMacroDefinitions(args, config);
+
+  args.push_back("-fdeprecated-macro");
+  args.push_back("--offload-new-driver");
+  args.push_back("-fskip-odr-check-in-gmf");
+  args.push_back("-fcxx-exceptions");
+  args.push_back("-fexceptions");
+  args.push_back("-O" + std::to_string(config.optimization_level));
+  args.push_back("-Wno-c++11-narrowing");
+
+  if (config.trace_includes)
+  {
+    args.push_back("-H");
+  }
+
+  appendExtraClangArgs(args, config);
+  args.push_back("-x");
+  args.push_back("cuda");
+}
+
 #ifdef _WIN32
 // Generate a minimal COFF import library for a given DLL.
 // This allows linking without requiring the Windows SDK or MSVC .lib files.
@@ -878,87 +990,10 @@ public:
     std::string temp_dir    = std::filesystem::path(output_ptx).parent_path().string();
     std::string source_file = temp_dir + "/" + input_file;
 
-    std::string resource_dir = CLANG_RESOURCE_DIR;
-
-    // PTX version floor is 7.8. Some generated device code uses features
-    // added in PTX 7.6 (e.g. `bmsk`), so older versions can fail to assemble
-    // even on sm_75/sm_80.
-    int ptx_version = 78;
-    if (config.sm_version >= 120)
-    {
-      ptx_version = 87;
-    }
-    else if (config.sm_version >= 100)
-    {
-      ptx_version = 85;
-    }
-    else if (config.sm_version >= 90)
-    {
-      ptx_version = 80;
-    }
-
+    std::vector<std::string> bitcode_files_to_link = config.device_bitcode_files;
     std::vector<std::string> arg_strings;
     arg_strings.push_back(source_file);
-    arg_strings.push_back("-triple");
-    arg_strings.push_back("nvptx64-nvidia-cuda");
-    arg_strings.push_back("-aux-triple");
-    arg_strings.push_back(getHostTargetTriple());
-    arg_strings.push_back("-S");
-    arg_strings.push_back("-aux-target-cpu");
-    arg_strings.push_back(getHostCPUName());
-    arg_strings.push_back("-fcuda-is-device");
-    arg_strings.push_back("-fcuda-allow-variadic-functions");
-#ifdef _WIN32
-    arg_strings.push_back("-fms-compatibility");
-    arg_strings.push_back("-fms-compatibility-version=19.40");
-#else
-    arg_strings.push_back("-fgnuc-version=4.2.1");
-#endif
-    arg_strings.push_back("-mlink-builtin-bitcode");
-    arg_strings.push_back(config.cuda_toolkit_path + "/nvvm/libdevice/libdevice.10.bc");
-    arg_strings.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
-    arg_strings.push_back("-target-cpu");
-    arg_strings.push_back("sm_" + std::to_string(config.sm_version));
-    arg_strings.push_back("-target-feature");
-    arg_strings.push_back("+ptx" + std::to_string(ptx_version));
-    arg_strings.push_back("-resource-dir");
-    arg_strings.push_back(resource_dir);
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/stubs");
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(
-      config.clang_headers_path.empty() ? std::string(CLANG_HEADERS_DIR) : config.clang_headers_path);
-    appendSystemIncludePaths(arg_strings, config);
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(config.cuda_toolkit_path + "/include");
-    arg_strings.push_back("-include");
-    arg_strings.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/__clang_cuda_runtime_wrapper.h");
-
-    appendIncludePaths(arg_strings, config);
-
-    arg_strings.push_back("-D__HOSTJIT_DEVICE_COMPILATION__=1");
-    arg_strings.push_back("-DNDEBUG");
-
-    std::vector<std::string> bitcode_files_to_link = config.device_bitcode_files;
-
-    appendMacroDefinitions(arg_strings, config);
-
-    arg_strings.push_back("-fdeprecated-macro");
-    arg_strings.push_back("--offload-new-driver");
-    arg_strings.push_back("-fskip-odr-check-in-gmf");
-    arg_strings.push_back("-fcxx-exceptions");
-    arg_strings.push_back("-fexceptions");
-    arg_strings.push_back("-O" + std::to_string(config.optimization_level));
-    arg_strings.push_back("-std=c++17");
-
-    if (config.trace_includes)
-    {
-      arg_strings.push_back("-H");
-    }
-
-    appendExtraClangArgs(arg_strings, config);
-    arg_strings.push_back("-x");
-    arg_strings.push_back("cuda");
+    appendCommonClangArgs(arg_strings, config, /*is_device=*/true);
 
     std::string device_pch_path = config.device_pch_path;
 
@@ -1090,7 +1125,7 @@ public:
             auto tm = target->createTargetMachine(
               mod->getTargetTriple(),
               "sm_" + std::to_string(config.sm_version),
-              "+ptx" + std::to_string(ptx_version),
+              "+ptx" + std::to_string(ptxVersionForSM(config.sm_version)),
               opt,
               llvm::Reloc::PIC_);
             if (tm)
@@ -1274,78 +1309,10 @@ public:
 
     std::string input_file   = input_name.empty() ? std::string("input.cu") : input_name;
     std::string source_file  = temp_dir + "/" + input_file;
-    std::string resource_dir = CLANG_RESOURCE_DIR;
-
-    // PTX version floor is 7.8. Some generated device code uses features
-    // added in PTX 7.6 (e.g. `bmsk`), so older versions can fail to assemble
-    // even on sm_75/sm_80.
-    int ptx_version = 78;
-    if (config.sm_version >= 120)
-    {
-      ptx_version = 87;
-    }
-    else if (config.sm_version >= 100)
-    {
-      ptx_version = 85;
-    }
-    else if (config.sm_version >= 90)
-    {
-      ptx_version = 80;
-    }
 
     std::vector<std::string> arg_strings;
     arg_strings.push_back(source_file);
-    arg_strings.push_back("-triple");
-    arg_strings.push_back("nvptx64-nvidia-cuda");
-    arg_strings.push_back("-aux-triple");
-    arg_strings.push_back(getHostTargetTriple());
-    arg_strings.push_back("-S");
-    arg_strings.push_back("-aux-target-cpu");
-    arg_strings.push_back(getHostCPUName());
-    arg_strings.push_back("-fcuda-is-device");
-    arg_strings.push_back("-fcuda-allow-variadic-functions");
-#ifdef _WIN32
-    arg_strings.push_back("-fms-compatibility");
-    arg_strings.push_back("-fms-compatibility-version=19.40");
-#else
-    arg_strings.push_back("-fgnuc-version=4.2.1");
-#endif
-    arg_strings.push_back("-mlink-builtin-bitcode");
-    arg_strings.push_back(config.cuda_toolkit_path + "/nvvm/libdevice/libdevice.10.bc");
-    arg_strings.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
-    arg_strings.push_back("-target-cpu");
-    arg_strings.push_back("sm_" + std::to_string(config.sm_version));
-    arg_strings.push_back("-target-feature");
-    arg_strings.push_back("+ptx" + std::to_string(ptx_version));
-    arg_strings.push_back("-resource-dir");
-    arg_strings.push_back(resource_dir);
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/stubs");
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(
-      config.clang_headers_path.empty() ? std::string(CLANG_HEADERS_DIR) : config.clang_headers_path);
-    appendSystemIncludePaths(arg_strings, config);
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(config.cuda_toolkit_path + "/include");
-    arg_strings.push_back("-include");
-    arg_strings.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/__clang_cuda_runtime_wrapper.h");
-
-    appendIncludePaths(arg_strings, config);
-
-    arg_strings.push_back("-D__HOSTJIT_DEVICE_COMPILATION__=1");
-    arg_strings.push_back("-DNDEBUG");
-
-    appendMacroDefinitions(arg_strings, config);
-
-    arg_strings.push_back("-fdeprecated-macro");
-    arg_strings.push_back("-fcxx-exceptions");
-    arg_strings.push_back("-fexceptions");
-    arg_strings.push_back("-O" + std::to_string(config.optimization_level));
-    arg_strings.push_back("-Wno-c++11-narrowing");
-    arg_strings.push_back("-std=c++17");
-    appendExtraClangArgs(arg_strings, config);
-    arg_strings.push_back("-x");
-    arg_strings.push_back("cuda");
+    appendCommonClangArgs(arg_strings, config, /*is_device=*/true);
 
     std::vector<const char*> args;
     for (const auto& arg : arg_strings)
@@ -1438,65 +1405,9 @@ public:
     std::string temp_dir    = std::filesystem::path(output_obj).parent_path().string();
     std::string source_file = temp_dir + "/host_" + input_file;
 
-    std::string resource_dir = CLANG_RESOURCE_DIR;
-
     std::vector<std::string> arg_strings;
     arg_strings.push_back(source_file);
-    arg_strings.push_back("-triple");
-    arg_strings.push_back(getHostTargetTriple());
-    arg_strings.push_back("-aux-triple");
-    arg_strings.push_back("nvptx64-nvidia-cuda");
-    arg_strings.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
-    arg_strings.push_back("-emit-obj");
-    arg_strings.push_back("-target-cpu");
-    arg_strings.push_back(getHostCPUName());
-    arg_strings.push_back("-fcuda-allow-variadic-functions");
-#ifdef _WIN32
-    arg_strings.push_back("-fms-compatibility");
-    arg_strings.push_back("-fms-compatibility-version=19.40");
-    // We do not have access to the windows CRT, but we are only running single threaded anyway
-    // Otherwise we have undefined symbols like _tls_index and _Init_thread_epoch
-    arg_strings.push_back("-fno-threadsafe-statics");
-#else
-    arg_strings.push_back("-fgnuc-version=4.2.1");
-#endif
-    arg_strings.push_back("-mrelocation-model");
-    arg_strings.push_back("pic");
-    arg_strings.push_back("-pic-level");
-    arg_strings.push_back("2");
-    arg_strings.push_back("-resource-dir");
-    arg_strings.push_back(resource_dir);
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/stubs");
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(
-      config.clang_headers_path.empty() ? std::string(CLANG_HEADERS_DIR) : config.clang_headers_path);
-    appendSystemIncludePaths(arg_strings, config);
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(config.cuda_toolkit_path + "/include");
-    arg_strings.push_back("-include");
-    arg_strings.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/__clang_cuda_runtime_wrapper.h");
-
-    appendIncludePaths(arg_strings, config);
-
-    arg_strings.push_back("-DNDEBUG");
-
-    appendMacroDefinitions(arg_strings, config);
-
-    arg_strings.push_back("-fdeprecated-macro");
-    arg_strings.push_back("--offload-new-driver");
-    arg_strings.push_back("-fskip-odr-check-in-gmf");
-    arg_strings.push_back("-O" + std::to_string(config.optimization_level));
-    arg_strings.push_back("-std=c++17");
-
-    if (config.trace_includes)
-    {
-      arg_strings.push_back("-H");
-    }
-
-    appendExtraClangArgs(arg_strings, config);
-    arg_strings.push_back("-x");
-    arg_strings.push_back("cuda");
+    appendCommonClangArgs(arg_strings, config, /*is_device=*/false);
 
     std::string host_pch_path = config.host_pch_path;
 
@@ -1858,127 +1769,17 @@ public:
       return false;
     }
 
-    initialize_llvm();
-
-    std::string resource_dir = CLANG_RESOURCE_DIR;
-    std::vector<std::string> arg_strings;
-    arg_strings.push_back(pch_source_path);
-
-    if (kind == LIBNVCC_PCH_DEVICE)
-    {
-      int ptx_version = 78;
-      if (config.sm_version >= 120)
-      {
-        ptx_version = 87;
-      }
-      else if (config.sm_version >= 100)
-      {
-        ptx_version = 85;
-      }
-      else if (config.sm_version >= 90)
-      {
-        ptx_version = 80;
-      }
-
-      arg_strings.push_back("-triple");
-      arg_strings.push_back("nvptx64-nvidia-cuda");
-      arg_strings.push_back("-aux-triple");
-      arg_strings.push_back(getHostTargetTriple());
-      arg_strings.push_back("-S");
-      arg_strings.push_back("-aux-target-cpu");
-      arg_strings.push_back(getHostCPUName());
-      arg_strings.push_back("-fcuda-is-device");
-      arg_strings.push_back("-fcuda-allow-variadic-functions");
-#ifdef _WIN32
-      arg_strings.push_back("-fms-compatibility");
-      arg_strings.push_back("-fms-compatibility-version=19.40");
-#else
-      arg_strings.push_back("-fgnuc-version=4.2.1");
-#endif
-      arg_strings.push_back("-mlink-builtin-bitcode");
-      arg_strings.push_back(config.cuda_toolkit_path + "/nvvm/libdevice/libdevice.10.bc");
-      arg_strings.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
-      arg_strings.push_back("-target-cpu");
-      arg_strings.push_back("sm_" + std::to_string(config.sm_version));
-      arg_strings.push_back("-target-feature");
-      arg_strings.push_back("+ptx" + std::to_string(ptx_version));
-    }
-    else if (kind == LIBNVCC_PCH_HOST)
-    {
-      arg_strings.push_back("-triple");
-      arg_strings.push_back(getHostTargetTriple());
-      arg_strings.push_back("-aux-triple");
-      arg_strings.push_back("nvptx64-nvidia-cuda");
-      arg_strings.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
-      arg_strings.push_back("-emit-obj");
-      arg_strings.push_back("-target-cpu");
-      arg_strings.push_back(getHostCPUName());
-      arg_strings.push_back("-fcuda-allow-variadic-functions");
-#ifdef _WIN32
-      arg_strings.push_back("-fms-compatibility");
-      arg_strings.push_back("-fms-compatibility-version=19.40");
-#else
-      arg_strings.push_back("-fgnuc-version=4.2.1");
-#endif
-      arg_strings.push_back("-mrelocation-model");
-      arg_strings.push_back("pic");
-      arg_strings.push_back("-pic-level");
-      arg_strings.push_back("2");
-    }
-    else
+    if (kind != LIBNVCC_PCH_DEVICE && kind != LIBNVCC_PCH_HOST)
     {
       diagnostics = "Invalid PCH kind";
       return false;
     }
 
-    arg_strings.push_back("-resource-dir");
-    arg_strings.push_back(resource_dir);
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/stubs");
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(
-      config.clang_headers_path.empty() ? std::string(CLANG_HEADERS_DIR) : config.clang_headers_path);
-    appendSystemIncludePaths(arg_strings, config);
-    arg_strings.push_back("-internal-isystem");
-    arg_strings.push_back(config.cuda_toolkit_path + "/include");
-    arg_strings.push_back("-include");
-    arg_strings.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/__clang_cuda_runtime_wrapper.h");
+    initialize_llvm();
 
-    appendIncludePaths(arg_strings, config);
-
-    if (kind == LIBNVCC_PCH_DEVICE)
-    {
-      arg_strings.push_back("-D__HOSTJIT_DEVICE_COMPILATION__=1");
-    }
-    arg_strings.push_back("-DNDEBUG");
-
-    appendMacroDefinitions(arg_strings, config);
-
-    arg_strings.push_back("-fdeprecated-macro");
-    if (kind == LIBNVCC_PCH_DEVICE)
-    {
-      arg_strings.push_back("--offload-new-driver");
-      arg_strings.push_back("-fskip-odr-check-in-gmf");
-      arg_strings.push_back("-fcxx-exceptions");
-      arg_strings.push_back("-fexceptions");
-    }
-    else
-    {
-      arg_strings.push_back("--offload-new-driver");
-      arg_strings.push_back("-fskip-odr-check-in-gmf");
-    }
-    arg_strings.push_back("-O" + std::to_string(config.optimization_level));
-    arg_strings.push_back("-std=c++17");
-
-    if (config.trace_includes)
-    {
-      arg_strings.push_back("-H");
-    }
-
-    appendExtraClangArgs(arg_strings, config);
-    arg_strings.push_back("-x");
-    arg_strings.push_back("cuda");
-
+    std::vector<std::string> arg_strings;
+    arg_strings.push_back(pch_source_path);
+    appendCommonClangArgs(arg_strings, config, /*is_device=*/kind == LIBNVCC_PCH_DEVICE);
     return generatePCH(source_code, pch_source_path, pch_output_path, arg_strings, diagnostics);
   }
 
