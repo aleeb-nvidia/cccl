@@ -260,6 +260,32 @@ static bool createDirectories(const std::filesystem::path& path, std::string& di
   return true;
 }
 
+static bool writeFile(const std::string& path,
+                      llvm::ArrayRef<char> data,
+                      std::string& diagnostics,
+                      const std::string& failure_message)
+{
+  std::error_code ec;
+  llvm::raw_fd_ostream out(path, ec);
+  if (ec)
+  {
+    diagnostics += failure_message + ": " + ec.message();
+    return false;
+  }
+
+  out.write(data.data(), data.size());
+  out.flush();
+  if (out.has_error())
+  {
+    ec = out.error();
+    diagnostics += failure_message + ": " + ec.message();
+    out.clear_error();
+    return false;
+  }
+
+  return true;
+}
+
 static void removeAll(const std::filesystem::path& path)
 {
   std::error_code ec;
@@ -782,14 +808,13 @@ public:
                    std::string& diagnostics)
   {
     // Write preamble to the persistent source path
+    if (!writeFile(
+          pch_source_path,
+          llvm::ArrayRef<char>{pch_source.data(), pch_source.size()},
+          diagnostics,
+          "Failed to write PCH preamble to " + pch_source_path))
     {
-      std::ofstream f(pch_source_path);
-      if (!f)
-      {
-        diagnostics += "Failed to write PCH preamble to " + pch_source_path;
-        return false;
-      }
-      f << pch_source;
+      return false;
     }
 
     // Replace the source file arg with the persistent path
@@ -1728,11 +1753,12 @@ public:
 
       if (!output_cubin_path.empty())
       {
-        std::ofstream cubin_out(output_cubin_path, std::ios::binary);
-        cubin_out.write(cubin_data.data(), static_cast<std::streamsize>(cubin_data.size()));
-        if (!cubin_out)
+        if (!writeFile(
+              output_cubin_path,
+              llvm::ArrayRef<char>{cubin_data.data(), cubin_data.size()},
+              result.diagnostics,
+              "\nFailed to write cubin file"))
         {
-          result.diagnostics += "\nFailed to write cubin file";
           removeAll(temp_dir);
           return result;
         }
@@ -1787,11 +1813,12 @@ public:
         return result;
       }
 
-      std::ofstream out(fatbin_file, std::ios::binary);
-      out.write(fatbin_data.data(), static_cast<std::streamsize>(fatbin_data.size()));
-      if (!out)
+      if (!writeFile(
+            fatbin_file,
+            llvm::ArrayRef<char>{fatbin_data.data(), fatbin_data.size()},
+            result.diagnostics,
+            "\nFailed to write fatbin file"))
       {
-        result.diagnostics += "\nFailed to write fatbin file";
         removeAll(temp_dir);
         return result;
       }
