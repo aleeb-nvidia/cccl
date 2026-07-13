@@ -920,6 +920,98 @@ static bool createInvocationFromDriverArgs(const std::vector<std::string>& drive
   return clang::CompilerInvocation::CreateFromArgs(invocation, cc1_args, diag_engine);
 }
 
+static void appendClangArgsLog(std::string& diagnostics,
+                               const std::string& label,
+                               const std::vector<std::string>& args)
+{
+  diagnostics += label + ": ";
+  for (const auto& arg : args)
+  {
+    diagnostics += arg + " ";
+  }
+  diagnostics += "\n";
+}
+
+static clang::DiagnosticOptions createDiagnosticOptions()
+{
+  clang::DiagnosticOptions diag_opts;
+  diag_opts.ShowColors = false;
+  return diag_opts;
+}
+
+struct ClangCompilerSetup
+{
+  std::string diag_output;
+  llvm::raw_string_ostream diag_stream;
+  clang::DiagnosticOptions diag_opts;
+  clang::TextDiagnosticPrinter* diag_printer;
+  clang::IntrusiveRefCntPtr<clang::DiagnosticIDs> diag_ids;
+  clang::DiagnosticsEngine diag_engine;
+  clang::CompilerInstance compiler;
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> vfs;
+
+  explicit ClangCompilerSetup(llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> fs)
+      : diag_stream(diag_output)
+      , diag_opts(createDiagnosticOptions())
+      , diag_printer(new clang::TextDiagnosticPrinter(diag_stream, diag_opts))
+      , diag_ids(new clang::DiagnosticIDs())
+      , diag_engine(diag_ids, diag_opts, diag_printer)
+      , vfs(fs)
+  {}
+
+  clang::CompilerInvocation& invocation()
+  {
+    return compiler.getInvocation();
+  }
+
+  void appendDiagnosticsTo(std::string& diagnostics)
+  {
+    diag_stream.flush();
+    diagnostics += diag_output;
+  }
+};
+
+static std::unique_ptr<ClangCompilerSetup> createClangCompilerSetup(
+  std::vector<std::string> driver_arg_strings,
+  llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> vfs,
+  const std::string& pch_path,
+  const CompilerOptions& config,
+  const std::string& log_label,
+  std::string& diagnostics,
+  const std::string& failure_message)
+{
+  if (!pch_path.empty())
+  {
+    appendXclangArg(driver_arg_strings, "-include-pch");
+    appendXclangArg(driver_arg_strings, pch_path);
+  }
+
+  if (config.verbose)
+  {
+    appendClangArgsLog(diagnostics, log_label + " driver args", driver_arg_strings);
+  }
+
+  auto setup = std::make_unique<ClangCompilerSetup>(vfs);
+  std::vector<std::string> cc1_arg_strings;
+  if (!createInvocationFromDriverArgs(
+        driver_arg_strings, setup->vfs, setup->diag_engine, setup->invocation(), &cc1_arg_strings, diagnostics))
+  {
+    setup->appendDiagnosticsTo(diagnostics);
+    diagnostics += failure_message;
+    return nullptr;
+  }
+
+  if (config.verbose)
+  {
+    appendClangArgsLog(diagnostics, log_label + " args", cc1_arg_strings);
+  }
+
+  setup->compiler.createDiagnostics(setup->diag_engine.getClient(), false);
+  setup->compiler.setVirtualFileSystem(setup->vfs);
+  setup->compiler.createFileManager();
+  return setup;
+}
+
 #ifdef _WIN32
 // Generate a minimal COFF import library for a given DLL.
 // This allows linking without requiring the Windows SDK or MSVC .lib files.
@@ -1001,6 +1093,8 @@ public:
                    const std::string& pch_source_path,
                    const std::string& pch_output_path,
                    std::vector<std::string> arg_strings,
+                   const CompilerOptions& config,
+                   const std::string& log_label,
                    std::string& diagnostics)
   {
     // Write preamble to the persistent source path
@@ -1013,34 +1107,26 @@ public:
       return false;
     }
 
-    std::string diag_output;
-    llvm::raw_string_ostream diag_stream(diag_output);
-    clang::DiagnosticOptions diag_opts;
-    diag_opts.ShowColors = false;
-    auto* diag_printer   = new clang::TextDiagnosticPrinter(diag_stream, diag_opts);
-    clang::IntrusiveRefCntPtr<clang::DiagnosticIDs> diag_ids(new clang::DiagnosticIDs());
-    clang::DiagnosticsEngine diag_engine(diag_ids, diag_opts, diag_printer);
-
-    clang::CompilerInstance compiler;
-    auto& invocation = compiler.getInvocation();
-
-    if (!createInvocationFromDriverArgs(
-          arg_strings, llvm::vfs::getRealFileSystem(), diag_engine, invocation, nullptr, diagnostics))
+    auto setup = createClangCompilerSetup(
+      std::move(arg_strings),
+      llvm::vfs::getRealFileSystem(),
+      {},
+      config,
+      log_label,
+      diagnostics,
+      "\nFailed to create PCH compiler invocation");
+    if (!setup)
     {
-      diag_stream.flush();
-      diagnostics += diag_output + "\nFailed to create PCH compiler invocation";
       return false;
     }
 
-    compiler.createDiagnostics(diag_engine.getClient(), false);
-    compiler.createFileManager();
+    auto& compiler = setup->compiler;
     compiler.getFrontendOpts().OutputFile = pch_output_path;
 
     clang::GeneratePCHAction pch_action;
     bool success = compiler.ExecuteAction(pch_action);
 
-    diag_stream.flush();
-    diagnostics += diag_output;
+    setup->appendDiagnosticsTo(diagnostics);
 
     return success;
   }
@@ -1071,65 +1157,26 @@ public:
     std::vector<std::string> driver_arg_strings;
     appendCommonClangDriverArgs(driver_arg_strings, source_file, output_ptx, config, /*is_device=*/true);
 
-    std::string device_pch_path = config.device_pch_path;
-
-    if (config.verbose)
+    auto setup = createClangCompilerSetup(
+      std::move(driver_arg_strings),
+      createVFSWithSource(source_code, source_file),
+      config.device_pch_path,
+      config,
+      "Device",
+      diagnostics,
+      "\nFailed to create device compiler invocation");
+    if (!setup)
     {
-      diagnostics += "Device driver args: ";
-      for (const auto& arg : driver_arg_strings)
-      {
-        diagnostics += arg + " ";
-      }
-      diagnostics += "\n";
-    }
-
-    std::string diag_output;
-    llvm::raw_string_ostream diag_stream(diag_output);
-
-    clang::DiagnosticOptions diag_opts;
-    diag_opts.ShowColors                       = false;
-    clang::TextDiagnosticPrinter* diag_printer = new clang::TextDiagnosticPrinter(diag_stream, diag_opts);
-    clang::IntrusiveRefCntPtr<clang::DiagnosticIDs> diag_ids(new clang::DiagnosticIDs());
-    clang::DiagnosticsEngine diag_engine(diag_ids, diag_opts, diag_printer);
-
-    clang::CompilerInstance compiler;
-    auto& invocation = compiler.getInvocation();
-    auto vfs         = createVFSWithSource(source_code, source_file);
-
-    std::vector<std::string> cc1_arg_strings;
-    if (!createInvocationFromDriverArgs(driver_arg_strings, vfs, diag_engine, invocation, &cc1_arg_strings, diagnostics))
-    {
-      diag_stream.flush();
-      diagnostics += diag_output;
-      diagnostics += "\nFailed to create device compiler invocation";
       return false;
     }
 
-    if (config.verbose)
-    {
-      diagnostics += "Device args: ";
-      for (const auto& arg : cc1_arg_strings)
-      {
-        diagnostics += arg + " ";
-      }
-      diagnostics += "\n";
-    }
-
-    // --- PCH: load cached device PCH ---
-    if (!device_pch_path.empty() && pathExists(device_pch_path))
-    {
-      invocation.getPreprocessorOpts().ImplicitPCHInclude = device_pch_path;
-    }
-
-    compiler.createDiagnostics(diag_engine.getClient(), false);
-    compiler.setVirtualFileSystem(vfs);
-    compiler.createFileManager();
+    auto& compiler = setup->compiler;
     compiler.getFrontendOpts().OutputFile = output_ptx;
 
     if (config.trace_includes)
     {
       diagnostics += "\n=== Device Header Search Paths ===\n";
-      const auto& hso = invocation.getHeaderSearchOpts();
+      const auto& hso = setup->invocation().getHeaderSearchOpts();
       for (const auto& entry : hso.UserEntries)
       {
         diagnostics += "  " + entry.Path + "\n";
@@ -1358,8 +1405,7 @@ public:
       }
     }
 
-    diag_stream.flush();
-    diagnostics += diag_output;
+    setup->appendDiagnosticsTo(diagnostics);
 
     return success;
   }
@@ -1398,34 +1444,20 @@ public:
     appendCommonClangDriverArgs(
       driver_arg_strings, source_file, output_bitcode_path, config, /*is_device=*/true);
 
-    std::string diag_output;
-    llvm::raw_string_ostream diag_stream(diag_output);
-
-    clang::DiagnosticOptions diag_opts;
-    diag_opts.ShowColors                       = false;
-    clang::TextDiagnosticPrinter* diag_printer = new clang::TextDiagnosticPrinter(diag_stream, diag_opts);
-    clang::IntrusiveRefCntPtr<clang::DiagnosticIDs> diag_ids(new clang::DiagnosticIDs());
-    clang::DiagnosticsEngine diag_engine(diag_ids, diag_opts, diag_printer);
-
-    clang::CompilerInstance compiler;
-    auto& invocation = compiler.getInvocation();
-    auto vfs         = createVFSWithSource(source_code, source_file);
-
-    if (!createInvocationFromDriverArgs(driver_arg_strings, vfs, diag_engine, invocation, nullptr, result.diagnostics))
+    auto setup = createClangCompilerSetup(
+      std::move(driver_arg_strings),
+      createVFSWithSource(source_code, source_file),
+      config.device_pch_path,
+      config,
+      "Device bitcode",
+      result.diagnostics,
+      "\nFailed to create compiler invocation");
+    if (!setup)
     {
-      diag_stream.flush();
-      result.diagnostics += diag_output + "\nFailed to create compiler invocation";
       return result;
     }
 
-    if (!config.device_pch_path.empty())
-    {
-      invocation.getPreprocessorOpts().ImplicitPCHInclude = config.device_pch_path;
-    }
-
-    compiler.createDiagnostics(diag_engine.getClient(), false);
-    compiler.setVirtualFileSystem(vfs);
-    compiler.createFileManager();
+    auto& compiler = setup->compiler;
 
     llvm::LLVMContext llvm_context;
     clang::EmitLLVMOnlyAction emit_llvm_action(&llvm_context);
@@ -1462,8 +1494,7 @@ public:
       }
     }
 
-    diag_stream.flush();
-    result.diagnostics += diag_output;
+    setup->appendDiagnosticsTo(result.diagnostics);
     if (config.keep_artifacts)
     {
       cleanup_temp_dir.release();
@@ -1482,70 +1513,31 @@ public:
     std::string temp_dir    = std::filesystem::path(output_obj).parent_path().string();
     std::string source_file = temp_dir + "/host_" + input_file;
 
-    std::string host_pch_path = config.host_pch_path;
-
     std::vector<std::string> driver_arg_strings;
     appendCommonClangDriverArgs(driver_arg_strings, source_file, output_obj, config, /*is_device=*/false);
     appendXclangArg(driver_arg_strings, "-fcuda-include-gpubinary");
     appendXclangArg(driver_arg_strings, fatbin_path);
 
-    if (config.verbose)
+    auto setup = createClangCompilerSetup(
+      std::move(driver_arg_strings),
+      createVFSWithSource(source_code, source_file),
+      config.host_pch_path,
+      config,
+      "Host",
+      diagnostics,
+      "\nFailed to create host compiler invocation");
+    if (!setup)
     {
-      diagnostics += "Host driver args: ";
-      for (const auto& arg : driver_arg_strings)
-      {
-        diagnostics += arg + " ";
-      }
-      diagnostics += "\n";
-    }
-
-    std::string diag_output;
-    llvm::raw_string_ostream diag_stream(diag_output);
-
-    clang::DiagnosticOptions diag_opts;
-    diag_opts.ShowColors                       = false;
-    clang::TextDiagnosticPrinter* diag_printer = new clang::TextDiagnosticPrinter(diag_stream, diag_opts);
-    clang::IntrusiveRefCntPtr<clang::DiagnosticIDs> diag_ids(new clang::DiagnosticIDs());
-    clang::DiagnosticsEngine diag_engine(diag_ids, diag_opts, diag_printer);
-
-    clang::CompilerInstance compiler;
-    auto& invocation = compiler.getInvocation();
-    auto vfs         = createVFSWithSource(source_code, source_file);
-
-    std::vector<std::string> cc1_arg_strings;
-    if (!createInvocationFromDriverArgs(driver_arg_strings, vfs, diag_engine, invocation, &cc1_arg_strings, diagnostics))
-    {
-      diag_stream.flush();
-      diagnostics += diag_output;
-      diagnostics += "\nFailed to create host compiler invocation";
       return false;
     }
 
-    if (config.verbose)
-    {
-      diagnostics += "Host args: ";
-      for (const auto& arg : cc1_arg_strings)
-      {
-        diagnostics += arg + " ";
-      }
-      diagnostics += "\n";
-    }
-
-    // --- PCH: load cached host PCH ---
-    if (!host_pch_path.empty() && pathExists(host_pch_path))
-    {
-      invocation.getPreprocessorOpts().ImplicitPCHInclude = host_pch_path;
-    }
-
-    compiler.createDiagnostics(diag_engine.getClient(), false);
-    compiler.setVirtualFileSystem(vfs);
-    compiler.createFileManager();
+    auto& compiler = setup->compiler;
     compiler.getFrontendOpts().OutputFile = output_obj;
 
     if (config.trace_includes)
     {
       diagnostics += "\n=== Host Header Search Paths ===\n";
-      const auto& hso = invocation.getHeaderSearchOpts();
+      const auto& hso = setup->invocation().getHeaderSearchOpts();
       for (const auto& entry : hso.UserEntries)
       {
         diagnostics += "  " + entry.Path + "\n";
@@ -1567,8 +1559,7 @@ public:
       diagnostics += "=== End Included Files ===\n\n";
     }
 
-    diag_stream.flush();
-    diagnostics += diag_output;
+    setup->appendDiagnosticsTo(diagnostics);
 
     return success;
   }
@@ -1846,7 +1837,14 @@ public:
     std::vector<std::string> arg_strings;
     appendCommonClangDriverArgs(
       arg_strings, pch_source_path, pch_output_path, config, /*is_device=*/kind == LIBNVCC_PCH_DEVICE);
-    return generatePCH(source_code, pch_source_path, pch_output_path, arg_strings, diagnostics);
+    return generatePCH(
+      source_code,
+      pch_source_path,
+      pch_output_path,
+      std::move(arg_strings),
+      config,
+      kind == LIBNVCC_PCH_DEVICE ? "Device PCH" : "Host PCH",
+      diagnostics);
   }
 
   LinkResult linkToSharedLibrary(
