@@ -1,6 +1,12 @@
 #include <clang/Basic/DiagnosticOptions.h>
+#include <clang/Basic/DiagnosticDriver.h>
 #include <clang/Basic/TargetInfo.h>
 #include <clang/CodeGen/CodeGenAction.h>
+#include <clang/Driver/Compilation.h>
+#include <clang/Driver/Driver.h>
+#include <clang/Driver/Job.h>
+#include <clang/Driver/Tool.h>
+#include <clang/Driver/ToolChain.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/CompilerInvocation.h>
 #include <clang/Frontend/FrontendActions.h>
@@ -692,15 +698,6 @@ static void appendExtraClangArgs(std::vector<std::string>& args, const CompilerO
   args.insert(args.end(), options.extra_clang_args.begin(), options.extra_clang_args.end());
 }
 
-static void appendSystemIncludePaths(std::vector<std::string>& args, const CompilerOptions& options)
-{
-  for (const auto& include_path : options.system_include_paths)
-  {
-    args.push_back("-internal-isystem");
-    args.push_back(include_path);
-  }
-}
-
 static void appendIncludePaths(std::vector<std::string>& args, const CompilerOptions& options)
 {
   for (const auto& include_path : options.include_paths)
@@ -743,97 +740,184 @@ static int ptxVersionForSM(int sm_version)
   return 78;
 }
 
-static void appendCommonClangArgs(
-  std::vector<std::string>& args, const CompilerOptions& config, bool is_device)
+static void appendXclangArg(std::vector<std::string>& args, const std::string& arg)
 {
-  if (is_device)
-  {
-    const int ptx_version = ptxVersionForSM(config.sm_version);
+  args.push_back("-Xclang");
+  args.push_back(arg);
+}
 
-    args.push_back("-triple");
-    args.push_back("nvptx64-nvidia-cuda");
-    args.push_back("-aux-triple");
-    args.push_back(getHostTargetTriple());
-    args.push_back("-S");
-    args.push_back("-aux-target-cpu");
-    args.push_back(getHostCPUName());
-    args.push_back("-fcuda-is-device");
-    args.push_back("-fcuda-allow-variadic-functions");
-    args.push_back("-mlink-builtin-bitcode");
-    args.push_back(config.cuda_toolkit_path + "/nvvm/libdevice/libdevice.10.bc");
-    args.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
-    args.push_back("-target-cpu");
-    args.push_back("sm_" + std::to_string(config.sm_version));
-    args.push_back("-target-feature");
-    args.push_back("+ptx" + std::to_string(ptx_version));
-  }
-  else
-  {
-    args.push_back("-triple");
-    args.push_back(getHostTargetTriple());
-    args.push_back("-aux-triple");
-    args.push_back("nvptx64-nvidia-cuda");
-    args.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
-    args.push_back("-emit-obj");
-    args.push_back("-target-cpu");
-    args.push_back(getHostCPUName());
-    args.push_back("-fcuda-allow-variadic-functions");
-#ifdef _WIN32
-    // We do not have access to the windows CRT, but we are only running single threaded anyway.
-    // Otherwise we have undefined symbols like _tls_index and _Init_thread_epoch.
-    args.push_back("-fno-threadsafe-statics");
-#endif
-    args.push_back("-mrelocation-model");
-    args.push_back("pic");
-    args.push_back("-pic-level");
-    args.push_back("2");
-  }
+static void appendXclangArg(std::vector<std::string>& args, const char* arg)
+{
+  args.push_back("-Xclang");
+  args.push_back(arg);
+}
 
-#ifdef _WIN32
-    args.push_back("-fms-compatibility");
-    args.push_back("-fms-compatibility-version=19.40");
-#else
-    args.push_back("-fgnuc-version=4.2.1");
-#endif
+static void appendDriverInternalSystemInclude(std::vector<std::string>& args, const std::string& include_path)
+{
+  appendXclangArg(args, "-internal-isystem");
+  appendXclangArg(args, include_path);
+}
 
+static void appendCommonClangDriverArgs(std::vector<std::string>& args,
+                                        const std::string& source_file,
+                                        const std::string& output_file,
+                                        const CompilerOptions& config,
+                                        bool is_device)
+{
+  // Common driver options.
+  args.push_back("clang++");
+  args.push_back("-x");
+  args.push_back("cuda");
+  args.push_back(source_file);
+  args.push_back("-target");
+  args.push_back(getHostTargetTriple());
+  args.push_back(is_device ? "--cuda-device-only" : "--cuda-host-only");
+  args.push_back("--cuda-gpu-arch=sm_" + std::to_string(config.sm_version));
+  args.push_back("--cuda-path=" + config.cuda_toolkit_path);
+  args.push_back("-Wno-unknown-cuda-version");
+  args.push_back("-fno-exceptions");
+  args.push_back("-fno-discard-value-names");
+  args.push_back("-nocudainc");
+  args.push_back("-nostdinc");
+  args.push_back("-nostdinc++");
+  args.push_back("-nobuiltininc");
   args.push_back("-resource-dir");
   args.push_back(CLANG_RESOURCE_DIR);
-  args.push_back("-internal-isystem");
-  args.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/stubs");
-  args.push_back("-internal-isystem");
-  args.push_back(config.clang_headers_path.empty() ? std::string(CLANG_HEADERS_DIR) : config.clang_headers_path);
-  appendSystemIncludePaths(args, config);
-  args.push_back("-internal-isystem");
-  args.push_back(config.cuda_toolkit_path + "/include");
-  args.push_back("-include");
-  args.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/__clang_cuda_runtime_wrapper.h");
-
-  appendIncludePaths(args, config);
-
-  if (is_device)
-  {
-    args.push_back("-D__HOSTJIT_DEVICE_COMPILATION__=1");
-  }
-  args.push_back("-DNDEBUG");
-
-  appendMacroDefinitions(args, config);
-
-  args.push_back("-fdeprecated-macro");
   args.push_back("--offload-new-driver");
-  args.push_back("-fskip-odr-check-in-gmf");
-  args.push_back("-fcxx-exceptions");
-  args.push_back("-fexceptions");
   args.push_back("-O" + std::to_string(config.optimization_level));
   args.push_back("-Wno-c++11-narrowing");
+  args.push_back("-DNDEBUG");
+
+#ifdef _WIN32
+  args.push_back("-fms-compatibility");
+#endif
+
+  if (!output_file.empty())
+  {
+    args.push_back("-o");
+    args.push_back(output_file);
+  }
 
   if (config.trace_includes)
   {
     args.push_back("-H");
   }
 
+  // Common cc1 options.
+  appendXclangArg(args, "-target-sdk-version=" CUDA_SDK_VERSION);
+  appendXclangArg(args, "-fcuda-allow-variadic-functions");
+  appendXclangArg(args, "-fdeprecated-macro");
+
+  // Device/host-specific options.
+  if (is_device)
+  {
+    args.push_back("-S");
+    args.push_back("-emit-llvm");
+    appendXclangArg(args, "-aux-target-cpu");
+    appendXclangArg(args, getHostCPUName());
+    appendXclangArg(args, "-target-cpu");
+    appendXclangArg(args, "sm_" + std::to_string(config.sm_version));
+    appendXclangArg(args, "-target-feature");
+    appendXclangArg(args, "+ptx" + std::to_string(ptxVersionForSM(config.sm_version)));
+    args.push_back("-D__HOSTJIT_DEVICE_COMPILATION__=1");
+  }
+  else
+  {
+    args.push_back("-c");
+    args.push_back("-fPIC");
+    appendXclangArg(args, "-target-cpu");
+    appendXclangArg(args, getHostCPUName());
+    appendXclangArg(args, "-mrelocation-model");
+    appendXclangArg(args, "pic");
+    appendXclangArg(args, "-pic-level");
+    appendXclangArg(args, "2");
+#ifdef _WIN32
+    // We do not have access to the windows CRT, but we are only running single threaded anyway.
+    // Otherwise we have undefined symbols like _tls_index and _Init_thread_epoch.
+    args.push_back("-fno-threadsafe-statics");
+#endif
+  }
+
+  // Include paths and other user-specified options.
+  appendDriverInternalSystemInclude(args, config.hostjit_include_path + "/hostjit/cuda_minimal/stubs");
+  appendDriverInternalSystemInclude(
+    args, config.clang_headers_path.empty() ? std::string(CLANG_HEADERS_DIR) : config.clang_headers_path);
+  for (const auto& include_path : config.system_include_paths)
+  {
+    appendDriverInternalSystemInclude(args, include_path);
+  }
+  appendDriverInternalSystemInclude(args, config.cuda_toolkit_path + "/include");
+  args.push_back("-include");
+  args.push_back(config.hostjit_include_path + "/hostjit/cuda_minimal/__clang_cuda_runtime_wrapper.h");
+  appendIncludePaths(args, config);
+  appendMacroDefinitions(args, config);
   appendExtraClangArgs(args, config);
-  args.push_back("-x");
-  args.push_back("cuda");
+}
+
+static bool createInvocationFromDriverArgs(const std::vector<std::string>& driver_arg_strings,
+                                           llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> vfs,
+                                           clang::DiagnosticsEngine& diag_engine,
+                                           clang::CompilerInvocation& invocation,
+                                           std::vector<std::string>* cc1_arg_strings,
+                                           std::string& diagnostics)
+{
+  std::vector<const char*> driver_args;
+  driver_args.reserve(driver_arg_strings.size());
+  for (const auto& arg : driver_arg_strings)
+  {
+    driver_args.push_back(arg.c_str());
+  }
+
+  if (driver_args.empty())
+  {
+    diagnostics += "\nClang driver received no arguments";
+    return false;
+  }
+
+  clang::driver::Driver driver(
+    driver_arg_strings.front(), getHostTargetTriple(), diag_engine, "libnvcc clang driver", vfs);
+  driver.setCheckInputsExist(false);
+  driver.setProbePrecompiled(false);
+  driver.setTargetAndMode(clang::driver::ToolChain::getTargetAndModeFromProgramName(driver_arg_strings.front()));
+  diag_engine.setSeverity(
+    clang::diag::warn_drv_new_cuda_version, clang::diag::Severity::Ignored, clang::SourceLocation());
+  diag_engine.setSeverity(
+    clang::diag::warn_drv_partially_supported_cuda_version, clang::diag::Severity::Ignored, clang::SourceLocation());
+
+  std::unique_ptr<clang::driver::Compilation> compilation(driver.BuildCompilation(driver_args));
+  if (!compilation)
+  {
+    diagnostics += "\nClang driver failed to build a compilation";
+    return false;
+  }
+
+  const clang::driver::Command* clang_command = nullptr;
+  for (const auto& job : compilation->getJobs())
+  {
+    if (llvm::StringRef(job.getCreator().getName()) != "clang")
+    {
+      continue;
+    }
+    if (clang_command != nullptr)
+    {
+      diagnostics += "\nClang driver produced multiple clang jobs";
+      return false;
+    }
+    clang_command = &job;
+  }
+
+  if (clang_command == nullptr)
+  {
+    diagnostics += "\nClang driver did not produce a clang job";
+    return false;
+  }
+
+  const auto& cc1_args = clang_command->getArguments();
+  if (cc1_arg_strings)
+  {
+    cc1_arg_strings->assign(cc1_args.begin(), cc1_args.end());
+  }
+  return clang::CompilerInvocation::CreateFromArgs(invocation, cc1_args, diag_engine);
 }
 
 #ifdef _WIN32
@@ -913,7 +997,6 @@ public:
   CompilerImpl() {}
 
   // Write preamble to a persistent file and generate a PCH from it.
-  // arg_strings[0] will be replaced with the persistent preamble path.
   bool generatePCH(const std::string& pch_source,
                    const std::string& pch_source_path,
                    const std::string& pch_output_path,
@@ -930,15 +1013,6 @@ public:
       return false;
     }
 
-    // Replace the source file arg with the persistent path
-    arg_strings[0] = pch_source_path;
-
-    std::vector<const char*> args;
-    for (const auto& arg : arg_strings)
-    {
-      args.push_back(arg.c_str());
-    }
-
     std::string diag_output;
     llvm::raw_string_ostream diag_stream(diag_output);
     clang::DiagnosticOptions diag_opts;
@@ -950,7 +1024,8 @@ public:
     clang::CompilerInstance compiler;
     auto& invocation = compiler.getInvocation();
 
-    if (!clang::CompilerInvocation::CreateFromArgs(invocation, args, diag_engine))
+    if (!createInvocationFromDriverArgs(
+          arg_strings, llvm::vfs::getRealFileSystem(), diag_engine, invocation, nullptr, diagnostics))
     {
       diag_stream.flush();
       diagnostics += diag_output + "\nFailed to create PCH compiler invocation";
@@ -992,22 +1067,16 @@ public:
     std::string source_file = temp_dir + "/" + input_file;
 
     std::vector<std::string> bitcode_files_to_link = config.device_bitcode_files;
-    std::vector<std::string> arg_strings;
-    arg_strings.push_back(source_file);
-    appendCommonClangArgs(arg_strings, config, /*is_device=*/true);
+
+    std::vector<std::string> driver_arg_strings;
+    appendCommonClangDriverArgs(driver_arg_strings, source_file, output_ptx, config, /*is_device=*/true);
 
     std::string device_pch_path = config.device_pch_path;
 
-    std::vector<const char*> args;
-    for (const auto& arg : arg_strings)
-    {
-      args.push_back(arg.c_str());
-    }
-
     if (config.verbose)
     {
-      diagnostics += "Device args: ";
-      for (const auto& arg : arg_strings)
+      diagnostics += "Device driver args: ";
+      for (const auto& arg : driver_arg_strings)
       {
         diagnostics += arg + " ";
       }
@@ -1025,13 +1094,25 @@ public:
 
     clang::CompilerInstance compiler;
     auto& invocation = compiler.getInvocation();
+    auto vfs         = createVFSWithSource(source_code, source_file);
 
-    if (!clang::CompilerInvocation::CreateFromArgs(invocation, args, diag_engine))
+    std::vector<std::string> cc1_arg_strings;
+    if (!createInvocationFromDriverArgs(driver_arg_strings, vfs, diag_engine, invocation, &cc1_arg_strings, diagnostics))
     {
       diag_stream.flush();
       diagnostics += diag_output;
       diagnostics += "\nFailed to create device compiler invocation";
       return false;
+    }
+
+    if (config.verbose)
+    {
+      diagnostics += "Device args: ";
+      for (const auto& arg : cc1_arg_strings)
+      {
+        diagnostics += arg + " ";
+      }
+      diagnostics += "\n";
     }
 
     // --- PCH: load cached device PCH ---
@@ -1040,7 +1121,6 @@ public:
       invocation.getPreprocessorOpts().ImplicitPCHInclude = device_pch_path;
     }
 
-    auto vfs = createVFSWithSource(source_code, source_file);
     compiler.createDiagnostics(diag_engine.getClient(), false);
     compiler.setVirtualFileSystem(vfs);
     compiler.createFileManager();
@@ -1314,15 +1394,9 @@ public:
     std::string input_file   = input_name.empty() ? std::string("input.cu") : input_name;
     std::string source_file  = temp_dir + "/" + input_file;
 
-    std::vector<std::string> arg_strings;
-    arg_strings.push_back(source_file);
-    appendCommonClangArgs(arg_strings, config, /*is_device=*/true);
-
-    std::vector<const char*> args;
-    for (const auto& arg : arg_strings)
-    {
-      args.push_back(arg.c_str());
-    }
+    std::vector<std::string> driver_arg_strings;
+    appendCommonClangDriverArgs(
+      driver_arg_strings, source_file, output_bitcode_path, config, /*is_device=*/true);
 
     std::string diag_output;
     llvm::raw_string_ostream diag_stream(diag_output);
@@ -1335,11 +1409,12 @@ public:
 
     clang::CompilerInstance compiler;
     auto& invocation = compiler.getInvocation();
+    auto vfs         = createVFSWithSource(source_code, source_file);
 
-    if (!clang::CompilerInvocation::CreateFromArgs(invocation, args, diag_engine))
+    if (!createInvocationFromDriverArgs(driver_arg_strings, vfs, diag_engine, invocation, nullptr, result.diagnostics))
     {
       diag_stream.flush();
-      result.diagnostics = diag_output + "\nFailed to create compiler invocation";
+      result.diagnostics += diag_output + "\nFailed to create compiler invocation";
       return result;
     }
 
@@ -1348,7 +1423,6 @@ public:
       invocation.getPreprocessorOpts().ImplicitPCHInclude = config.device_pch_path;
     }
 
-    auto vfs = createVFSWithSource(source_code, source_file);
     compiler.createDiagnostics(diag_engine.getClient(), false);
     compiler.setVirtualFileSystem(vfs);
     compiler.createFileManager();
@@ -1408,26 +1482,17 @@ public:
     std::string temp_dir    = std::filesystem::path(output_obj).parent_path().string();
     std::string source_file = temp_dir + "/host_" + input_file;
 
-    std::vector<std::string> arg_strings;
-    arg_strings.push_back(source_file);
-    appendCommonClangArgs(arg_strings, config, /*is_device=*/false);
-
     std::string host_pch_path = config.host_pch_path;
 
-    // Add fatbin embedding (per-build, not part of PCH)
-    arg_strings.push_back("-fcuda-include-gpubinary");
-    arg_strings.push_back(fatbin_path);
-
-    std::vector<const char*> args;
-    for (const auto& arg : arg_strings)
-    {
-      args.push_back(arg.c_str());
-    }
+    std::vector<std::string> driver_arg_strings;
+    appendCommonClangDriverArgs(driver_arg_strings, source_file, output_obj, config, /*is_device=*/false);
+    appendXclangArg(driver_arg_strings, "-fcuda-include-gpubinary");
+    appendXclangArg(driver_arg_strings, fatbin_path);
 
     if (config.verbose)
     {
-      diagnostics += "Host args: ";
-      for (const auto& arg : arg_strings)
+      diagnostics += "Host driver args: ";
+      for (const auto& arg : driver_arg_strings)
       {
         diagnostics += arg + " ";
       }
@@ -1445,13 +1510,25 @@ public:
 
     clang::CompilerInstance compiler;
     auto& invocation = compiler.getInvocation();
+    auto vfs         = createVFSWithSource(source_code, source_file);
 
-    if (!clang::CompilerInvocation::CreateFromArgs(invocation, args, diag_engine))
+    std::vector<std::string> cc1_arg_strings;
+    if (!createInvocationFromDriverArgs(driver_arg_strings, vfs, diag_engine, invocation, &cc1_arg_strings, diagnostics))
     {
       diag_stream.flush();
       diagnostics += diag_output;
       diagnostics += "\nFailed to create host compiler invocation";
       return false;
+    }
+
+    if (config.verbose)
+    {
+      diagnostics += "Host args: ";
+      for (const auto& arg : cc1_arg_strings)
+      {
+        diagnostics += arg + " ";
+      }
+      diagnostics += "\n";
     }
 
     // --- PCH: load cached host PCH ---
@@ -1460,7 +1537,6 @@ public:
       invocation.getPreprocessorOpts().ImplicitPCHInclude = host_pch_path;
     }
 
-    auto vfs = createVFSWithSource(source_code, source_file);
     compiler.createDiagnostics(diag_engine.getClient(), false);
     compiler.setVirtualFileSystem(vfs);
     compiler.createFileManager();
@@ -1768,8 +1844,8 @@ public:
     initialize_llvm();
 
     std::vector<std::string> arg_strings;
-    arg_strings.push_back(pch_source_path);
-    appendCommonClangArgs(arg_strings, config, /*is_device=*/kind == LIBNVCC_PCH_DEVICE);
+    appendCommonClangDriverArgs(
+      arg_strings, pch_source_path, pch_output_path, config, /*is_device=*/kind == LIBNVCC_PCH_DEVICE);
     return generatePCH(source_code, pch_source_path, pch_output_path, arg_strings, diagnostics);
   }
 
