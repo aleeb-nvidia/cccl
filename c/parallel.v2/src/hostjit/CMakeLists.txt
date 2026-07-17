@@ -13,17 +13,17 @@ cmake_path(GET _c_parallel_dir PARENT_PATH _c_dir) # c
 cmake_path(GET _c_dir PARENT_PATH _cccl_root) # cccl
 set(_hostjit_include_dir "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
-set(LIBNVCC_CPM_CMAKE_PATH "${_cccl_root}/cmake/CPM.cmake")
-set(LIBNVCC_HEADER_INSTALL_DESTINATION "cuda/cccl/headers/libnvcc")
-set(LIBNVCC_CLANG_HEADER_INSTALL_DESTINATION "cuda/cccl/headers/clang")
+set(CUDACC_CPM_CMAKE_PATH "${_cccl_root}/cmake/CPM.cmake")
+set(CUDACC_HEADER_INSTALL_DESTINATION "cuda/cccl/headers/cudacc")
+set(CUDACC_CLANG_HEADER_INSTALL_DESTINATION "cuda/cccl/headers/clang")
 if (CCCL_C_PARALLEL_V2_LIBRARY_OUTPUT_DIRECTORY)
   set(
-    LIBNVCC_LIBRARY_OUTPUT_DIRECTORY
+    CUDACC_LIBRARY_OUTPUT_DIRECTORY
     "${CCCL_C_PARALLEL_V2_LIBRARY_OUTPUT_DIRECTORY}"
   )
 endif()
 
-add_subdirectory(libnvcc)
+add_subdirectory(cudacc)
 
 # --------------------------------------------------------------------------
 # hostjit library
@@ -74,7 +74,7 @@ else()
   target_link_libraries(cccl.c.parallel.v2.hostjit_lib PRIVATE ole32)
 endif()
 
-target_link_libraries(cccl.c.parallel.v2.hostjit_lib PUBLIC libnvcc)
+target_link_libraries(cccl.c.parallel.v2.hostjit_lib PUBLIC cudacc)
 
 if (CUDAToolkit_FOUND)
   target_link_libraries(cccl.c.parallel.v2.hostjit_lib PUBLIC CUDA::cudart)
@@ -106,7 +106,7 @@ install(
 )
 
 # On Windows with multi-config generators (Visual Studio), exclude hostjit
-# targets that depend on libnvcc from Debug builds.
+# targets that depend on cudacc from Debug builds.
 if (MSVC)
   set_target_properties(
     cccl.c.parallel.v2.hostjit_lib

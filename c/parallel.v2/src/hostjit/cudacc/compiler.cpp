@@ -13,7 +13,7 @@
 #include <clang/Frontend/FrontendOptions.h>
 #include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <clang/Lex/PreprocessorOptions.h>
-#include <libnvcc/libnvcc.h>
+#include <cudacc/cudacc.h>
 #include <lld/Common/Driver.h>
 #include <llvm/ADT/ScopeExit.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
@@ -79,7 +79,7 @@ LLD_HAS_DRIVER(elf)
 #include <nvFatbin.h>
 #include <nvJitLink.h>
 
-namespace libnvcc
+namespace cudacc
 {
 static std::once_flag llvm_init_flag;
 
@@ -906,7 +906,7 @@ static bool createInvocationFromDriverArgs(const std::vector<std::string>& drive
   }
 
   clang::driver::Driver driver(
-    driver_arg_strings.front(), getHostTargetTriple(), diag_engine, "libnvcc clang driver", vfs);
+    driver_arg_strings.front(), getHostTargetTriple(), diag_engine, "cudacc clang driver", vfs);
   driver.setCheckInputsExist(false);
   driver.setProbePrecompiled(false);
   driver.setTargetAndMode(clang::driver::ToolChain::getTargetAndModeFromProgramName(driver_arg_strings.front()));
@@ -1460,10 +1460,10 @@ public:
                 pass.run(*mod);
                 dest.flush();
 
-                // Debug: when LIBNVCC_DUMP_DIR is set, dump the optimized IR
+                // Debug: when CUDACC_DUMP_DIR is set, dump the optimized IR
                 // and the PTX fed to ptxas, keyed by entry point name. Lets us
                 // inspect codegen (register pressure, launch bounds) post-inline.
-                if (const char* dump_dir = std::getenv("LIBNVCC_DUMP_DIR"))
+                if (const char* dump_dir = std::getenv("CUDACC_DUMP_DIR"))
                 {
                   std::error_code dec;
                   std::filesystem::create_directories(dump_dir, dec);
@@ -1914,7 +1914,7 @@ public:
   }
 
   bool createPCH(const std::string& source_code,
-                 libnvccPCHKind kind,
+                 cudaccPCHKind kind,
                  const std::string& pch_source_path,
                  const std::string& pch_output_path,
                  const CompilerOptions& config,
@@ -1927,7 +1927,7 @@ public:
       return false;
     }
 
-    if (kind != LIBNVCC_PCH_DEVICE && kind != LIBNVCC_PCH_HOST)
+    if (kind != CUDACC_PCH_DEVICE && kind != CUDACC_PCH_HOST)
     {
       diagnostics = "Invalid PCH kind";
       return false;
@@ -1937,14 +1937,14 @@ public:
 
     std::vector<std::string> arg_strings;
     appendCommonClangDriverArgs(
-      arg_strings, pch_source_path, pch_output_path, config, /*is_device=*/kind == LIBNVCC_PCH_DEVICE);
+      arg_strings, pch_source_path, pch_output_path, config, /*is_device=*/kind == CUDACC_PCH_DEVICE);
     return generatePCH(
       source_code,
       pch_source_path,
       pch_output_path,
       std::move(arg_strings),
       config,
-      kind == LIBNVCC_PCH_DEVICE ? "Device PCH" : "Host PCH",
+      kind == CUDACC_PCH_DEVICE ? "Device PCH" : "Host PCH",
       diagnostics);
   }
 
@@ -2185,19 +2185,19 @@ public:
     return result;
   }
 };
-} // namespace libnvcc
+} // namespace cudacc
 
-struct libnvccProgram_st
+struct cudaccProgram_st
 {
   std::string source;
   std::string name;
   std::string log;
-  libnvcc::CompilerImpl compiler;
+  cudacc::CompilerImpl compiler;
 };
 
 namespace
 {
-void setProgramLog(libnvccProgram prog, std::string log)
+void setProgramLog(cudaccProgram prog, std::string log)
 {
   if (prog)
   {
@@ -2206,10 +2206,10 @@ void setProgramLog(libnvccProgram prog, std::string log)
 }
 
 bool parseProgramOptions(
-  libnvccProgram prog, int num_options, const char* const* raw_options, libnvcc::CompilerOptions& options)
+  cudaccProgram prog, int num_options, const char* const* raw_options, cudacc::CompilerOptions& options)
 {
   std::string error;
-  if (!libnvcc::parseOptions(num_options, raw_options, options, error))
+  if (!cudacc::parseOptions(num_options, raw_options, options, error))
   {
     setProgramLog(prog, "Option error: " + error);
     return false;
@@ -2218,86 +2218,86 @@ bool parseProgramOptions(
 }
 } // anonymous namespace
 
-extern "C" const char* libnvccGetErrorString(libnvccResult result)
+extern "C" const char* cudaccGetErrorString(cudaccResult result)
 {
   switch (result)
   {
-    case LIBNVCC_SUCCESS:
-      return "LIBNVCC_SUCCESS";
-    case LIBNVCC_ERROR_OUT_OF_MEMORY:
-      return "LIBNVCC_ERROR_OUT_OF_MEMORY";
-    case LIBNVCC_ERROR_PROGRAM_CREATION_FAILURE:
-      return "LIBNVCC_ERROR_PROGRAM_CREATION_FAILURE";
-    case LIBNVCC_ERROR_INVALID_INPUT:
-      return "LIBNVCC_ERROR_INVALID_INPUT";
-    case LIBNVCC_ERROR_INVALID_PROGRAM:
-      return "LIBNVCC_ERROR_INVALID_PROGRAM";
-    case LIBNVCC_ERROR_INVALID_OPTION:
-      return "LIBNVCC_ERROR_INVALID_OPTION";
-    case LIBNVCC_ERROR_COMPILATION:
-      return "LIBNVCC_ERROR_COMPILATION";
-    case LIBNVCC_ERROR_LINKING:
-      return "LIBNVCC_ERROR_LINKING";
-    case LIBNVCC_ERROR_PCH_CREATE:
-      return "LIBNVCC_ERROR_PCH_CREATE";
-    case LIBNVCC_ERROR_INTERNAL_ERROR:
-      return "LIBNVCC_ERROR_INTERNAL_ERROR";
+    case CUDACC_SUCCESS:
+      return "CUDACC_SUCCESS";
+    case CUDACC_ERROR_OUT_OF_MEMORY:
+      return "CUDACC_ERROR_OUT_OF_MEMORY";
+    case CUDACC_ERROR_PROGRAM_CREATION_FAILURE:
+      return "CUDACC_ERROR_PROGRAM_CREATION_FAILURE";
+    case CUDACC_ERROR_INVALID_INPUT:
+      return "CUDACC_ERROR_INVALID_INPUT";
+    case CUDACC_ERROR_INVALID_PROGRAM:
+      return "CUDACC_ERROR_INVALID_PROGRAM";
+    case CUDACC_ERROR_INVALID_OPTION:
+      return "CUDACC_ERROR_INVALID_OPTION";
+    case CUDACC_ERROR_COMPILATION:
+      return "CUDACC_ERROR_COMPILATION";
+    case CUDACC_ERROR_LINKING:
+      return "CUDACC_ERROR_LINKING";
+    case CUDACC_ERROR_PCH_CREATE:
+      return "CUDACC_ERROR_PCH_CREATE";
+    case CUDACC_ERROR_INTERNAL_ERROR:
+      return "CUDACC_ERROR_INTERNAL_ERROR";
   }
-  return "LIBNVCC_ERROR_UNKNOWN";
+  return "CUDACC_ERROR_UNKNOWN";
 }
 
-extern "C" libnvccResult libnvccCreateProgram(libnvccProgram* prog, const char* src, const char* name)
+extern "C" cudaccResult cudaccCreateProgram(cudaccProgram* prog, const char* src, const char* name)
 {
   if (!prog || !src)
   {
-    return LIBNVCC_ERROR_INVALID_INPUT;
+    return CUDACC_ERROR_INVALID_INPUT;
   }
   *prog = nullptr;
 
-  auto* program   = new libnvccProgram_st;
+  auto* program   = new cudaccProgram_st;
   program->source = src;
   program->name   = (name && name[0]) ? name : "input.cu";
   *prog           = program;
-  return LIBNVCC_SUCCESS;
+  return CUDACC_SUCCESS;
 }
 
-extern "C" libnvccResult libnvccDestroyProgram(libnvccProgram* prog)
+extern "C" cudaccResult cudaccDestroyProgram(cudaccProgram* prog)
 {
   if (!prog || !*prog)
   {
-    return LIBNVCC_SUCCESS;
+    return CUDACC_SUCCESS;
   }
   delete *prog;
   *prog = nullptr;
-  return LIBNVCC_SUCCESS;
+  return CUDACC_SUCCESS;
 }
 
-extern "C" libnvccResult libnvccCompileProgramToDeviceBitcode(
-  libnvccProgram prog, const char* outputBitcodePath, int numOptions, const char* const* options)
+extern "C" cudaccResult cudaccCompileProgramToDeviceBitcode(
+  cudaccProgram prog, const char* outputBitcodePath, int numOptions, const char* const* options)
 {
   if (!prog)
   {
-    return LIBNVCC_ERROR_INVALID_PROGRAM;
+    return CUDACC_ERROR_INVALID_PROGRAM;
   }
   if (!outputBitcodePath || outputBitcodePath[0] == '\0')
   {
     setProgramLog(prog, "outputBitcodePath must be non-empty");
-    return LIBNVCC_ERROR_INVALID_INPUT;
+    return CUDACC_ERROR_INVALID_INPUT;
   }
 
-  libnvcc::CompilerOptions parsed_options;
+  cudacc::CompilerOptions parsed_options;
   if (!parseProgramOptions(prog, numOptions, options, parsed_options))
   {
-    return LIBNVCC_ERROR_INVALID_OPTION;
+    return CUDACC_ERROR_INVALID_OPTION;
   }
 
   auto result = prog->compiler.compileToDeviceBitcode(prog->source, prog->name, outputBitcodePath, parsed_options);
   setProgramLog(prog, result.diagnostics);
-  return result.success ? LIBNVCC_SUCCESS : LIBNVCC_ERROR_COMPILATION;
+  return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_COMPILATION;
 }
 
-extern "C" libnvccResult libnvccCompileProgramToObject(
-  libnvccProgram prog,
+extern "C" cudaccResult cudaccCompileProgramToObject(
+  cudaccProgram prog,
   const char* outputObjectPath,
   const char* outputCubinPath,
   int numOptions,
@@ -2305,28 +2305,28 @@ extern "C" libnvccResult libnvccCompileProgramToObject(
 {
   if (!prog)
   {
-    return LIBNVCC_ERROR_INVALID_PROGRAM;
+    return CUDACC_ERROR_INVALID_PROGRAM;
   }
   if (!outputObjectPath || outputObjectPath[0] == '\0')
   {
     setProgramLog(prog, "outputObjectPath must be non-empty");
-    return LIBNVCC_ERROR_INVALID_INPUT;
+    return CUDACC_ERROR_INVALID_INPUT;
   }
 
-  libnvcc::CompilerOptions parsed_options;
+  cudacc::CompilerOptions parsed_options;
   if (!parseProgramOptions(prog, numOptions, options, parsed_options))
   {
-    return LIBNVCC_ERROR_INVALID_OPTION;
+    return CUDACC_ERROR_INVALID_OPTION;
   }
 
   const std::string cubin_path = outputCubinPath ? outputCubinPath : "";
   auto result = prog->compiler.compileToObject(prog->source, prog->name, outputObjectPath, cubin_path, parsed_options);
   setProgramLog(prog, result.diagnostics);
-  return result.success ? LIBNVCC_SUCCESS : LIBNVCC_ERROR_COMPILATION;
+  return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_COMPILATION;
 }
 
-extern "C" libnvccResult libnvccLinkToSharedLibrary(
-  libnvccProgram prog,
+extern "C" cudaccResult cudaccLinkToSharedLibrary(
+  cudaccProgram prog,
   int numObjectFiles,
   const char* const* objectFiles,
   const char* outputLibraryPath,
@@ -2335,18 +2335,18 @@ extern "C" libnvccResult libnvccLinkToSharedLibrary(
 {
   if (!prog)
   {
-    return LIBNVCC_ERROR_INVALID_PROGRAM;
+    return CUDACC_ERROR_INVALID_PROGRAM;
   }
   if (numObjectFiles < 0 || (numObjectFiles > 0 && !objectFiles) || !outputLibraryPath || outputLibraryPath[0] == '\0')
   {
     setProgramLog(prog, "Invalid link input");
-    return LIBNVCC_ERROR_INVALID_INPUT;
+    return CUDACC_ERROR_INVALID_INPUT;
   }
 
-  libnvcc::CompilerOptions parsed_options;
+  cudacc::CompilerOptions parsed_options;
   if (!parseProgramOptions(prog, numOptions, options, parsed_options))
   {
-    return LIBNVCC_ERROR_INVALID_OPTION;
+    return CUDACC_ERROR_INVALID_OPTION;
   }
 
   std::vector<std::string> object_files;
@@ -2356,19 +2356,19 @@ extern "C" libnvccResult libnvccLinkToSharedLibrary(
     if (!objectFiles[i] || objectFiles[i][0] == '\0')
     {
       setProgramLog(prog, "Object file path must be non-empty");
-      return LIBNVCC_ERROR_INVALID_INPUT;
+      return CUDACC_ERROR_INVALID_INPUT;
     }
     object_files.emplace_back(objectFiles[i]);
   }
 
   auto result = prog->compiler.linkToSharedLibrary(object_files, outputLibraryPath, parsed_options);
   setProgramLog(prog, result.diagnostics);
-  return result.success ? LIBNVCC_SUCCESS : LIBNVCC_ERROR_LINKING;
+  return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_LINKING;
 }
 
-extern "C" libnvccResult libnvccCreatePCH(
-  libnvccProgram prog,
-  libnvccPCHKind kind,
+extern "C" cudaccResult cudaccCreatePCH(
+  cudaccProgram prog,
+  cudaccPCHKind kind,
   const char* pchSourcePath,
   const char* pchOutputPath,
   int numOptions,
@@ -2376,51 +2376,51 @@ extern "C" libnvccResult libnvccCreatePCH(
 {
   if (!prog)
   {
-    return LIBNVCC_ERROR_INVALID_PROGRAM;
+    return CUDACC_ERROR_INVALID_PROGRAM;
   }
   if (!pchSourcePath || pchSourcePath[0] == '\0' || !pchOutputPath || pchOutputPath[0] == '\0')
   {
     setProgramLog(prog, "PCH source and output paths must be non-empty");
-    return LIBNVCC_ERROR_INVALID_INPUT;
+    return CUDACC_ERROR_INVALID_INPUT;
   }
 
-  libnvcc::CompilerOptions parsed_options;
+  cudacc::CompilerOptions parsed_options;
   if (!parseProgramOptions(prog, numOptions, options, parsed_options))
   {
-    return LIBNVCC_ERROR_INVALID_OPTION;
+    return CUDACC_ERROR_INVALID_OPTION;
   }
 
   std::string diagnostics;
   bool success =
     prog->compiler.createPCH(prog->source, kind, pchSourcePath, pchOutputPath, parsed_options, diagnostics);
   setProgramLog(prog, diagnostics);
-  return success ? LIBNVCC_SUCCESS : LIBNVCC_ERROR_PCH_CREATE;
+  return success ? CUDACC_SUCCESS : CUDACC_ERROR_PCH_CREATE;
 }
 
-extern "C" libnvccResult libnvccGetProgramLogSize(libnvccProgram prog, size_t* logSizeRet)
+extern "C" cudaccResult cudaccGetProgramLogSize(cudaccProgram prog, size_t* logSizeRet)
 {
   if (!prog)
   {
-    return LIBNVCC_ERROR_INVALID_PROGRAM;
+    return CUDACC_ERROR_INVALID_PROGRAM;
   }
   if (!logSizeRet)
   {
-    return LIBNVCC_ERROR_INVALID_INPUT;
+    return CUDACC_ERROR_INVALID_INPUT;
   }
   *logSizeRet = prog->log.size() + 1;
-  return LIBNVCC_SUCCESS;
+  return CUDACC_SUCCESS;
 }
 
-extern "C" libnvccResult libnvccGetProgramLog(libnvccProgram prog, char* log)
+extern "C" cudaccResult cudaccGetProgramLog(cudaccProgram prog, char* log)
 {
   if (!prog)
   {
-    return LIBNVCC_ERROR_INVALID_PROGRAM;
+    return CUDACC_ERROR_INVALID_PROGRAM;
   }
   if (!log)
   {
-    return LIBNVCC_ERROR_INVALID_INPUT;
+    return CUDACC_ERROR_INVALID_INPUT;
   }
   std::memcpy(log, prog->log.c_str(), prog->log.size() + 1);
-  return LIBNVCC_SUCCESS;
+  return CUDACC_SUCCESS;
 }

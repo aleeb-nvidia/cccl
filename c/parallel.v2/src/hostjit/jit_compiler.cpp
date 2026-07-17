@@ -59,7 +59,7 @@ std::string get_pch_source_path(const std::string& kind, int sm_version)
 
 bool create_pch_if_needed(
   hostjit::CompilerConfig config,
-  libnvccPCHKind kind,
+  cudaccPCHKind kind,
   const std::string& kind_name,
   std::string& diagnostics,
   std::string& pch_path)
@@ -76,30 +76,30 @@ bool create_pch_if_needed(
 
   std::vector<std::string> options;
   config.appendCommandLineArguments(options);
-  auto option_ptrs = hostjit::detail::make_libnvcc_option_ptrs(options);
+  auto option_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
-  hostjit::detail::LibnvccProgramGuard program;
-  auto create_result = libnvccCreateProgram(&program.program, pch_preamble_source, "hostjit_preamble.cu");
-  if (create_result != LIBNVCC_SUCCESS)
+  hostjit::detail::CudaccProgramGuard program;
+  auto create_result = cudaccCreateProgram(&program.program, pch_preamble_source, "hostjit_preamble.cu");
+  if (create_result != CUDACC_SUCCESS)
   {
-    diagnostics += "Failed to create libnvcc PCH program: ";
-    diagnostics += libnvccGetErrorString(create_result);
+    diagnostics += "Failed to create cudacc PCH program: ";
+    diagnostics += cudaccGetErrorString(create_result);
     diagnostics += "\n";
     pch_path.clear();
     return false;
   }
 
   auto source_path = get_pch_source_path(kind_name, config.sm_version);
-  auto pch_result  = libnvccCreatePCH(
+  auto pch_result  = cudaccCreatePCH(
     program.program,
     kind,
     source_path.c_str(),
     pch_path.c_str(),
     static_cast<int>(option_ptrs.size()),
     option_ptrs.empty() ? nullptr : option_ptrs.data());
-  if (pch_result != LIBNVCC_SUCCESS)
+  if (pch_result != CUDACC_SUCCESS)
   {
-    diagnostics += kind_name + " PCH generation failed: " + hostjit::detail::get_libnvcc_program_log(program.program);
+    diagnostics += kind_name + " PCH generation failed: " + hostjit::detail::get_cudacc_program_log(program.program);
     diagnostics += "\n";
     pch_path.clear();
     return false;
@@ -119,13 +119,13 @@ hostjit::CompilerConfig prepare_pch_config(const hostjit::CompilerConfig& config
   }
 
   std::string device_pch_path;
-  if (create_pch_if_needed(prepared, LIBNVCC_PCH_DEVICE, "device", diagnostics, device_pch_path))
+  if (create_pch_if_needed(prepared, CUDACC_PCH_DEVICE, "device", diagnostics, device_pch_path))
   {
     prepared.device_pch_path = std::move(device_pch_path);
   }
 
   std::string host_pch_path;
-  if (create_pch_if_needed(prepared, LIBNVCC_PCH_HOST, "host", diagnostics, host_pch_path))
+  if (create_pch_if_needed(prepared, CUDACC_PCH_HOST, "host", diagnostics, host_pch_path))
   {
     prepared.host_pch_path = std::move(host_pch_path);
   }
@@ -214,21 +214,21 @@ bool JITCompiler::compile(const std::string& source_code)
   }
 
   std::string pch_diagnostics;
-  CompilerConfig libnvcc_config = prepare_pch_config(config_, pch_diagnostics);
+  CompilerConfig cudacc_config = prepare_pch_config(config_, pch_diagnostics);
   if (config_.verbose && !pch_diagnostics.empty())
   {
     std::cout << pch_diagnostics;
   }
 
   std::vector<std::string> options;
-  libnvcc_config.appendCommandLineArguments(options);
-  auto option_ptrs = hostjit::detail::make_libnvcc_option_ptrs(options);
+  cudacc_config.appendCommandLineArguments(options);
+  auto option_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
-  hostjit::detail::LibnvccProgramGuard program;
-  auto create_result = libnvccCreateProgram(&program.program, source_code.c_str(), "input.cu");
-  if (create_result != LIBNVCC_SUCCESS)
+  hostjit::detail::CudaccProgramGuard program;
+  auto create_result = cudaccCreateProgram(&program.program, source_code.c_str(), "input.cu");
+  if (create_result != CUDACC_SUCCESS)
   {
-    last_error_      = std::string("Failed to create libnvcc program: ") + libnvccGetErrorString(create_result);
+    last_error_      = std::string("Failed to create cudacc program: ") + cudaccGetErrorString(create_result);
     last_error_code_ = std::make_error_code(std::errc::io_error);
     removeTempDirectory();
     return false;
@@ -238,15 +238,15 @@ bool JITCompiler::compile(const std::string& source_code)
   std::filesystem::path cubin_path = temp_dir_ / "device.cubin";
   std::string obj_path_string      = obj_path.string();
   std::string cubin_path_string    = cubin_path.string();
-  auto compile_result    = libnvccCompileProgramToObject(
+  auto compile_result    = cudaccCompileProgramToObject(
     program.program,
     obj_path_string.c_str(),
     cubin_path_string.c_str(),
     static_cast<int>(option_ptrs.size()),
     option_ptrs.empty() ? nullptr : option_ptrs.data());
-  auto compile_log = hostjit::detail::get_libnvcc_program_log(program.program);
+  auto compile_log = hostjit::detail::get_cudacc_program_log(program.program);
 
-  if (compile_result != LIBNVCC_SUCCESS)
+  if (compile_result != CUDACC_SUCCESS)
   {
     last_error_      = "Compilation failed:\n" + compile_log;
     last_error_code_ = std::make_error_code(std::errc::io_error);
@@ -275,16 +275,16 @@ bool JITCompiler::compile(const std::string& source_code)
 #endif
   std::string lib_path_string = lib_path.string();
   const char* object_files[]  = {obj_path_string.c_str()};
-  auto link_result           = libnvccLinkToSharedLibrary(
+  auto link_result           = cudaccLinkToSharedLibrary(
     program.program,
     1,
     object_files,
     lib_path_string.c_str(),
     static_cast<int>(option_ptrs.size()),
     option_ptrs.empty() ? nullptr : option_ptrs.data());
-  auto link_log = hostjit::detail::get_libnvcc_program_log(program.program);
+  auto link_log = hostjit::detail::get_cudacc_program_log(program.program);
 
-  if (link_result != LIBNVCC_SUCCESS)
+  if (link_result != CUDACC_SUCCESS)
   {
     last_error_      = "Linking failed:\n" + link_log;
     last_error_code_ = std::make_error_code(std::errc::io_error);

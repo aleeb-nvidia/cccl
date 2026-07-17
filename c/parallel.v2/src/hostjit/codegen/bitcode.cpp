@@ -107,21 +107,21 @@ bool BitcodeCollector::compile_and_add(const char* source, size_t source_size, c
 
   std::vector<std::string> options;
   config_.appendCommandLineArguments(options);
-  auto option_ptrs = hostjit::detail::make_libnvcc_option_ptrs(options);
+  auto option_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
-  hostjit::detail::LibnvccProgramGuard program;
-  auto create_result = libnvccCreateProgram(&program.program, src.c_str(), "input.cu");
-  if (create_result != LIBNVCC_SUCCESS)
+  hostjit::detail::CudaccProgramGuard program;
+  auto create_result = cudaccCreateProgram(&program.program, src.c_str(), "input.cu");
+  if (create_result != CUDACC_SUCCESS)
   {
-    fprintf(stderr, "\nERROR creating libnvcc program for %s: %s\n", name.c_str(), libnvccGetErrorString(create_result));
+    fprintf(stderr, "\nERROR creating cudacc program for %s: %s\n", name.c_str(), cudaccGetErrorString(create_result));
     return false;
   }
 
-  auto result = libnvccCompileProgramToDeviceBitcode(
+  auto result = cudaccCompileProgramToDeviceBitcode(
     program.program, path.c_str(), static_cast<int>(option_ptrs.size()), option_ptrs.data());
-  if (result != LIBNVCC_SUCCESS)
+  if (result != CUDACC_SUCCESS)
   {
-    auto log = hostjit::detail::get_libnvcc_program_log(program.program);
+    auto log = hostjit::detail::get_cudacc_program_log(program.program);
     fprintf(stderr, "\nERROR compiling %s to bitcode: %s\n", name.c_str(), log.c_str());
     return false;
   }

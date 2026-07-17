@@ -4,25 +4,25 @@
 #include <string>
 #include <vector>
 
-#include <libnvcc/libnvcc.h>
+#include <cudacc/cudacc.h>
 
 namespace hostjit::detail
 {
-struct LibnvccProgramGuard
+struct CudaccProgramGuard
 {
-  libnvccProgram program = nullptr;
+  cudaccProgram program = nullptr;
 
-  LibnvccProgramGuard()                                      = default;
-  LibnvccProgramGuard(const LibnvccProgramGuard&)            = delete;
-  LibnvccProgramGuard& operator=(const LibnvccProgramGuard&) = delete;
+  CudaccProgramGuard()                                      = default;
+  CudaccProgramGuard(const CudaccProgramGuard&)            = delete;
+  CudaccProgramGuard& operator=(const CudaccProgramGuard&) = delete;
 
-  ~LibnvccProgramGuard()
+  ~CudaccProgramGuard()
   {
-    libnvccDestroyProgram(&program);
+    cudaccDestroyProgram(&program);
   }
 };
 
-inline std::vector<const char*> make_libnvcc_option_ptrs(const std::vector<std::string>& options)
+inline std::vector<const char*> make_cudacc_option_ptrs(const std::vector<std::string>& options)
 {
   std::vector<const char*> ptrs;
   ptrs.reserve(options.size());
@@ -33,10 +33,10 @@ inline std::vector<const char*> make_libnvcc_option_ptrs(const std::vector<std::
   return ptrs;
 }
 
-inline std::string get_libnvcc_program_log(libnvccProgram program)
+inline std::string get_cudacc_program_log(cudaccProgram program)
 {
   size_t log_size = 0;
-  if (libnvccGetProgramLogSize(program, &log_size) != LIBNVCC_SUCCESS)
+  if (cudaccGetProgramLogSize(program, &log_size) != CUDACC_SUCCESS)
   {
     return {};
   }
@@ -48,9 +48,9 @@ inline std::string get_libnvcc_program_log(libnvccProgram program)
   }
 
   std::string log(log_size, '\0');
-  auto res = libnvccGetProgramLog(program, log.data());
-  assert(res == LIBNVCC_SUCCESS && "Copying the log failed even though size calculation succeeded?");
-  assert(log.back() == '\0' && "libnvccGetProgramLog() should append a NUL character");
+  auto res = cudaccGetProgramLog(program, log.data());
+  assert(res == CUDACC_SUCCESS && "Copying the log failed even though size calculation succeeded?");
+  assert(log.back() == '\0' && "cudaccGetProgramLog() should append a NUL character");
   log.pop_back(); // Drop the extra NUL.
   return log;
 }
