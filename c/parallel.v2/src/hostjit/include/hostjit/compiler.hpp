@@ -1,57 +1,86 @@
 #pragma once
 
-#include <cassert>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <cudacc/cudacc.h>
 
 namespace hostjit::detail
 {
-struct CudaccProgramGuard
+struct CudaccOutputGuard
 {
-  cudaccProgram program = nullptr;
+  cudaccOutput output{};
 
-  CudaccProgramGuard()                                      = default;
-  CudaccProgramGuard(const CudaccProgramGuard&)            = delete;
-  CudaccProgramGuard& operator=(const CudaccProgramGuard&) = delete;
+  CudaccOutputGuard()                                     = default;
+  CudaccOutputGuard(const CudaccOutputGuard&)            = delete;
+  CudaccOutputGuard& operator=(const CudaccOutputGuard&) = delete;
 
-  ~CudaccProgramGuard()
+  ~CudaccOutputGuard()
   {
-    cudaccDestroyProgram(&program);
+    cudaccDestroyOutput(&output);
   }
 };
 
-inline std::vector<const char*> make_cudacc_option_ptrs(const std::vector<std::string>& options)
+class CudaccOptionsBuilder
 {
-  std::vector<const char*> ptrs;
-  ptrs.reserve(options.size());
-  for (const auto& option : options)
+public:
+  void add(std::string arg)
   {
-    ptrs.push_back(option.c_str());
+    args_.push_back(Arg{std::move(arg), nullptr, false});
   }
-  return ptrs;
-}
 
-inline std::string get_cudacc_program_log(cudaccProgram program)
+  void add_pair(std::string flag, std::string value)
+  {
+    add(std::move(flag));
+    add(std::move(value));
+  }
+
+  void add_memory_input(std::string flag, std::span<const char> data)
+  {
+    add(std::move(flag));
+    add(std::to_string(data.size()));
+    args_.push_back(Arg{{}, data.data(), true});
+  }
+
+  void add_all(const std::vector<std::string>& args)
+  {
+    for (const auto& arg : args)
+    {
+      add(arg);
+    }
+  }
+
+  std::vector<const char*> argv()
+  {
+    argv_.clear();
+    argv_.reserve(args_.size());
+    for (const auto& arg : args_)
+    {
+      argv_.push_back(arg.is_raw ? arg.raw : arg.value.c_str());
+    }
+    return argv_;
+  }
+
+private:
+  struct Arg
+  {
+    std::string value;
+    const char* raw = nullptr;
+    bool is_raw     = false;
+  };
+
+  std::vector<Arg> args_;
+  std::vector<const char*> argv_;
+};
+
+inline std::string get_cudacc_output_log(const cudaccOutput& output)
 {
-  size_t log_size = 0;
-  if (cudaccGetProgramLogSize(program, &log_size) != CUDACC_SUCCESS)
+  if (!output.program_log)
   {
     return {};
   }
-
-  assert(log_size > 0 && "Log size should include NUL terminator");
-  if (log_size == 1)
-  {
-    return {};
-  }
-
-  std::string log(log_size, '\0');
-  auto res = cudaccGetProgramLog(program, log.data());
-  assert(res == CUDACC_SUCCESS && "Copying the log failed even though size calculation succeeded?");
-  assert(log.back() == '\0' && "cudaccGetProgramLog() should append a NUL character");
-  log.pop_back(); // Drop the extra NUL.
-  return log;
+  return std::string(output.program_log, output.program_log_size);
 }
 } // namespace hostjit::detail

@@ -59,7 +59,7 @@ std::string get_pch_source_path(const std::string& kind, int sm_version)
 
 bool create_pch_if_needed(
   hostjit::CompilerConfig config,
-  cudaccPCHKind kind,
+  bool is_device,
   const std::string& kind_name,
   std::string& diagnostics,
   std::string& pch_path)
@@ -74,32 +74,25 @@ bool create_pch_if_needed(
   config.device_pch_path.clear();
   config.host_pch_path.clear();
 
-  std::vector<std::string> options;
-  config.appendCommandLineArguments(options);
-  auto option_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
-
-  hostjit::detail::CudaccProgramGuard program;
-  auto create_result = cudaccCreateProgram(&program.program, pch_preamble_source, "hostjit_preamble.cu");
-  if (create_result != CUDACC_SUCCESS)
-  {
-    diagnostics += "Failed to create cudacc PCH program: ";
-    diagnostics += cudaccGetErrorString(create_result);
-    diagnostics += "\n";
-    pch_path.clear();
-    return false;
-  }
+  std::vector<std::string> base_options;
+  config.appendCommandLineArguments(base_options);
 
   auto source_path = get_pch_source_path(kind_name, config.sm_version);
-  auto pch_result  = cudaccCreatePCH(
-    program.program,
-    kind,
-    source_path.c_str(),
-    pch_path.c_str(),
-    static_cast<int>(option_ptrs.size()),
-    option_ptrs.empty() ? nullptr : option_ptrs.data());
+  hostjit::detail::CudaccOptionsBuilder options;
+  options.add_all(base_options);
+  options.add(is_device ? "--create-device-pch" : "--create-host-pch");
+  options.add("--source-name=hostjit_preamble.cu");
+  options.add("--pch-source-path=" + source_path);
+  options.add_pair("-o", pch_path);
+  options.add_memory_input(
+    "--input-source", std::span<const char>{pch_preamble_source, std::strlen(pch_preamble_source)});
+  auto option_ptrs = options.argv();
+
+  hostjit::detail::CudaccOutputGuard output;
+  auto pch_result = cudaccCompile(&output.output, option_ptrs.empty() ? nullptr : option_ptrs.data(), option_ptrs.size());
   if (pch_result != CUDACC_SUCCESS)
   {
-    diagnostics += kind_name + " PCH generation failed: " + hostjit::detail::get_cudacc_program_log(program.program);
+    diagnostics += kind_name + " PCH generation failed: " + hostjit::detail::get_cudacc_output_log(output.output);
     diagnostics += "\n";
     pch_path.clear();
     return false;
@@ -119,13 +112,13 @@ hostjit::CompilerConfig prepare_pch_config(const hostjit::CompilerConfig& config
   }
 
   std::string device_pch_path;
-  if (create_pch_if_needed(prepared, CUDACC_PCH_DEVICE, "device", diagnostics, device_pch_path))
+  if (create_pch_if_needed(prepared, true, "device", diagnostics, device_pch_path))
   {
     prepared.device_pch_path = std::move(device_pch_path);
   }
 
   std::string host_pch_path;
-  if (create_pch_if_needed(prepared, CUDACC_PCH_HOST, "host", diagnostics, host_pch_path))
+  if (create_pch_if_needed(prepared, false, "host", diagnostics, host_pch_path))
   {
     prepared.host_pch_path = std::move(host_pch_path);
   }
@@ -220,31 +213,62 @@ bool JITCompiler::compile(const std::string& source_code)
     std::cout << pch_diagnostics;
   }
 
-  std::vector<std::string> options;
-  cudacc_config.appendCommandLineArguments(options);
-  auto option_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
+  std::vector<std::string> base_options;
+  cudacc_config.appendCommandLineArguments(base_options);
 
-  hostjit::detail::CudaccProgramGuard program;
-  auto create_result = cudaccCreateProgram(&program.program, source_code.c_str(), "input.cu");
-  if (create_result != CUDACC_SUCCESS)
+  std::vector<std::vector<char>> device_bitcode_inputs;
+  device_bitcode_inputs.reserve(cudacc_config.device_bitcode_files.size());
+  for (const auto& bitcode_path : cudacc_config.device_bitcode_files)
   {
-    last_error_      = std::string("Failed to create cudacc program: ") + cudaccGetErrorString(create_result);
-    last_error_code_ = std::make_error_code(std::errc::io_error);
-    removeTempDirectory();
-    return false;
+    device_bitcode_inputs.emplace_back();
+    if (!read_file(bitcode_path, device_bitcode_inputs.back()))
+    {
+      last_error_      = "Compilation failed: device bitcode input could not be read: " + bitcode_path;
+      last_error_code_ = std::make_error_code(std::errc::io_error);
+      removeTempDirectory();
+      return false;
+    }
   }
 
-  std::filesystem::path obj_path   = temp_dir_ / "cuda_code.o";
-  std::filesystem::path cubin_path = temp_dir_ / "device.cubin";
-  std::string obj_path_string      = obj_path.string();
-  std::string cubin_path_string    = cubin_path.string();
-  auto compile_result    = cudaccCompileProgramToObject(
-    program.program,
-    obj_path_string.c_str(),
-    cubin_path_string.c_str(),
-    static_cast<int>(option_ptrs.size()),
-    option_ptrs.empty() ? nullptr : option_ptrs.data());
-  auto compile_log = hostjit::detail::get_cudacc_program_log(program.program);
+  std::vector<std::vector<char>> device_ltoir_inputs;
+  device_ltoir_inputs.reserve(cudacc_config.device_ltoir_files.size());
+  for (const auto& ltoir_path : cudacc_config.device_ltoir_files)
+  {
+    device_ltoir_inputs.emplace_back();
+    if (!read_file(ltoir_path, device_ltoir_inputs.back()))
+    {
+      last_error_      = "Compilation failed: device LTOIR input could not be read: " + ltoir_path;
+      last_error_code_ = std::make_error_code(std::errc::io_error);
+      removeTempDirectory();
+      return false;
+    }
+  }
+
+  std::filesystem::path obj_path = temp_dir_ / "cuda_code.o";
+  std::string obj_path_string    = obj_path.string();
+
+  hostjit::detail::CudaccOptionsBuilder compile_options;
+  compile_options.add_all(base_options);
+  compile_options.add("--compile");
+  compile_options.add("--source-name=input.cu");
+  compile_options.add_pair("-o", obj_path_string);
+  compile_options.add_memory_input("--input-source", std::span<const char>{source_code.data(), source_code.size()});
+  for (const auto& bitcode : device_bitcode_inputs)
+  {
+    compile_options.add_memory_input("--input-device-ir", std::span<const char>{bitcode.data(), bitcode.size()});
+  }
+  for (const auto& ltoir : device_ltoir_inputs)
+  {
+    compile_options.add_memory_input("--input-ltoir", std::span<const char>{ltoir.data(), ltoir.size()});
+  }
+  auto compile_option_ptrs = compile_options.argv();
+
+  hostjit::detail::CudaccOutputGuard compile_output;
+  auto compile_result = cudaccCompile(
+    &compile_output.output,
+    compile_option_ptrs.empty() ? nullptr : compile_option_ptrs.data(),
+    compile_option_ptrs.size());
+  auto compile_log = hostjit::detail::get_cudacc_output_log(compile_output.output);
 
   if (compile_result != CUDACC_SUCCESS)
   {
@@ -255,13 +279,15 @@ bool JITCompiler::compile(const std::string& source_code)
   }
 
   cubin_.clear();
-  if (!read_file(cubin_path, cubin_))
+  if (!compile_output.output.output_data || compile_output.output.output_size == 0)
   {
-    last_error_      = "Compilation failed: generated cubin could not be read";
+    last_error_      = "Compilation failed: generated cubin was not returned";
     last_error_code_ = std::make_error_code(std::errc::io_error);
     removeTempDirectory();
     return false;
   }
+  cubin_.assign(
+    compile_output.output.output_data, compile_output.output.output_data + compile_output.output.output_size);
 
   if (config_.verbose)
   {
@@ -274,15 +300,26 @@ bool JITCompiler::compile(const std::string& source_code)
   std::filesystem::path lib_path = temp_dir_ / "libcuda_code.so";
 #endif
   std::string lib_path_string = lib_path.string();
-  const char* object_files[]  = {obj_path_string.c_str()};
-  auto link_result           = cudaccLinkToSharedLibrary(
-    program.program,
-    1,
-    object_files,
-    lib_path_string.c_str(),
-    static_cast<int>(option_ptrs.size()),
-    option_ptrs.empty() ? nullptr : option_ptrs.data());
-  auto link_log = hostjit::detail::get_cudacc_program_log(program.program);
+
+  CompilerConfig link_config = cudacc_config;
+  link_config.device_pch_path.clear();
+  link_config.host_pch_path.clear();
+  std::vector<std::string> link_base_options;
+  link_config.appendCommandLineArguments(link_base_options);
+
+  hostjit::detail::CudaccOptionsBuilder link_options;
+  link_options.add_all(link_base_options);
+  link_options.add("--shared");
+  link_options.add("--input-object=" + obj_path_string);
+  link_options.add_pair("-o", lib_path_string);
+  auto link_option_ptrs = link_options.argv();
+
+  hostjit::detail::CudaccOutputGuard link_output;
+  auto link_result = cudaccCompile(
+    &link_output.output,
+    link_option_ptrs.empty() ? nullptr : link_option_ptrs.data(),
+    link_option_ptrs.size());
+  auto link_log = hostjit::detail::get_cudacc_output_log(link_output.output);
 
   if (link_result != CUDACC_SUCCESS)
   {

@@ -78,14 +78,6 @@ void CompilerConfig::appendCommandLineArguments(std::vector<std::string>& args) 
   {
     args.push_back("-L" + library_path);
   }
-  for (const auto& bitcode_file : device_bitcode_files)
-  {
-    args.push_back("--device-bitcode=" + bitcode_file);
-  }
-  for (const auto& ltoir_file : device_ltoir_files)
-  {
-    args.push_back("--device-ltoir=" + ltoir_file);
-  }
   append_cccl_macro_definitions(args);
   for (const auto& [macro_name, macro_value] : macro_definitions)
   {

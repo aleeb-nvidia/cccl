@@ -16,6 +16,7 @@
 #include <cudacc/cudacc.h>
 #include <lld/Common/Driver.h>
 #include <llvm/ADT/ScopeExit.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/LLVMContext.h>
@@ -69,6 +70,7 @@ LLD_HAS_DRIVER(elf)
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -129,8 +131,6 @@ struct CompilerOptions
   std::vector<std::string> system_include_paths;
   std::vector<std::string> include_paths;
   std::vector<std::string> library_paths;
-  std::vector<std::string> device_bitcode_files;
-  std::vector<std::string> device_ltoir_files;
   std::unordered_map<std::string, std::string> macro_definitions;
   std::vector<std::string> extra_clang_args;
   int sm_version         = 75;
@@ -141,10 +141,48 @@ struct CompilerOptions
   bool keep_artifacts    = false;
 };
 
+enum class OutputKind
+{
+  none,
+  device_ir,
+  ptx,
+  cubin,
+  fatbin,
+  create_device_pch,
+  create_host_pch,
+  compile,
+  shared,
+};
+
+struct MemoryInput
+{
+  std::span<const char> data;
+  std::string generated_name;
+};
+
+struct CompileRequest
+{
+  OutputKind output_kind = OutputKind::none;
+  CompilerOptions config;
+  bool has_source = false;
+  std::span<const char> source;
+  std::string source_name = "input.cu";
+  std::string output_path;
+  std::string pch_source_path;
+  std::vector<MemoryInput> device_ir_inputs;
+  std::vector<MemoryInput> ptx_inputs;
+  std::vector<MemoryInput> cubin_inputs;
+  std::vector<MemoryInput> ltoir_inputs;
+  std::vector<std::string> object_paths;
+  std::vector<std::string> archive_paths;
+  std::vector<std::string> link_input_paths;
+};
+
 struct CompilationResult
 {
   bool success = false;
   std::string object_file_path;
+  std::vector<char> cubin;
   std::string diagnostics;
 
   explicit operator bool() const
@@ -156,6 +194,43 @@ struct CompilationResult
 struct BitcodeResult
 {
   bool success = false;
+  std::vector<char> bitcode;
+  std::string diagnostics;
+
+  explicit operator bool() const
+  {
+    return success;
+  }
+};
+
+struct PtxResult
+{
+  bool success = false;
+  std::vector<char> ptx;
+  std::string diagnostics;
+
+  explicit operator bool() const
+  {
+    return success;
+  }
+};
+
+struct CubinResult
+{
+  bool success = false;
+  std::vector<char> cubin;
+  std::string diagnostics;
+
+  explicit operator bool() const
+  {
+    return success;
+  }
+};
+
+struct FatbinResult
+{
+  bool success = false;
+  std::vector<char> fatbin;
   std::string diagnostics;
 
   explicit operator bool() const
@@ -168,6 +243,19 @@ struct LinkResult
 {
   bool success = false;
   std::string library_path;
+  std::string diagnostics;
+
+  explicit operator bool() const
+  {
+    return success;
+  }
+};
+
+struct DeviceModuleResult
+{
+  bool success = false;
+  std::unique_ptr<llvm::LLVMContext> context;
+  std::unique_ptr<llvm::Module> module;
   std::string diagnostics;
 
   explicit operator bool() const
@@ -295,7 +383,7 @@ static bool createDirectories(const std::filesystem::path& path, std::string& di
 }
 
 static bool writeFile(const std::string& path,
-                      llvm::ArrayRef<char> data,
+                      std::span<const char> data,
                       std::string& diagnostics,
                       const std::string& failure_message)
 {
@@ -387,26 +475,163 @@ static bool parseMacroDefinition(const std::string& value, CompilerOptions& opti
   return true;
 }
 
-static bool parseOptions(int num_options, const char* const* raw_options, CompilerOptions& options, std::string& error)
+static bool parseSize(std::string_view value, size_t& out)
 {
-  if (num_options < 0)
+  if (value.empty())
   {
-    error = "Option count must be non-negative";
     return false;
   }
+
+  size_t parsed     = 0;
+  const char* begin = value.data();
+  const char* end   = begin + value.size();
+  auto [ptr, ec]    = std::from_chars(begin, end, parsed);
+  if (ec != std::errc{} || ptr != end)
+  {
+    return false;
+  }
+  out = parsed;
+  return true;
+}
+
+static bool setOutputKind(CompileRequest& request, OutputKind kind, std::string& error)
+{
+  if (request.output_kind != OutputKind::none)
+  {
+    error = "Multiple output kind options were specified";
+    return false;
+  }
+  request.output_kind = kind;
+  return true;
+}
+
+static bool takeRequiredNext(size_t& i,
+                             size_t num_options,
+                             const char* const* raw_options,
+                             std::string_view option_name,
+                             const char*& value,
+                             std::string& error)
+{
+  if (++i >= num_options || raw_options[i] == nullptr)
+  {
+    error = std::string(option_name) + " requires an argument";
+    return false;
+  }
+  value = raw_options[i];
+  return true;
+}
+
+static bool takeOptionValue(std::string_view option,
+                            std::string_view flag,
+                            size_t& i,
+                            size_t num_options,
+                            const char* const* raw_options,
+                            std::string& value,
+                            std::string& error)
+{
+  if (option == flag)
+  {
+    const char* next = nullptr;
+    if (!takeRequiredNext(i, num_options, raw_options, flag, next, error))
+    {
+      return false;
+    }
+    value = next;
+    return true;
+  }
+
+  const std::string eq_flag = std::string(flag) + "=";
+  if (option.starts_with(eq_flag))
+  {
+    value = std::string(option.substr(eq_flag.size()));
+    return true;
+  }
+
+  return false;
+}
+
+static bool parseMemoryInput(size_t& i,
+                             size_t num_options,
+                             const char* const* raw_options,
+                             std::string_view flag,
+                             std::vector<MemoryInput>& inputs,
+                             std::string_view extension,
+                             std::string& error)
+{
+  const char* size_arg = nullptr;
+  if (!takeRequiredNext(i, num_options, raw_options, flag, size_arg, error))
+  {
+    return false;
+  }
+
+  size_t size = 0;
+  if (!parseSize(size_arg, size) || size == 0)
+  {
+    error = std::string(flag) + " requires a positive decimal byte size";
+    return false;
+  }
+
+  const char* data = nullptr;
+  if (!takeRequiredNext(i, num_options, raw_options, flag, data, error))
+  {
+    return false;
+  }
+
+  inputs.push_back(MemoryInput{{data, size},
+                               "input" + std::to_string(inputs.size()) + std::string(extension)});
+  return true;
+}
+
+static bool parseSourceInput(size_t& i,
+                             size_t num_options,
+                             const char* const* raw_options,
+                             CompileRequest& request,
+                             std::string& error)
+{
+  if (request.has_source)
+  {
+    error = "Only one --input-source option may be specified";
+    return false;
+  }
+
+  const char* size_arg = nullptr;
+  if (!takeRequiredNext(i, num_options, raw_options, "--input-source", size_arg, error))
+  {
+    return false;
+  }
+
+  size_t size = 0;
+  if (!parseSize(size_arg, size) || size == 0)
+  {
+    error = "--input-source requires a positive decimal byte size";
+    return false;
+  }
+
+  const char* data = nullptr;
+  if (!takeRequiredNext(i, num_options, raw_options, "--input-source", data, error))
+  {
+    return false;
+  }
+  request.has_source = true;
+  request.source     = {data, size};
+  return true;
+}
+
+static bool parseOptions(size_t num_options, const char* const* raw_options, CompileRequest& request, std::string& error)
+{
   if (num_options > 0 && raw_options == nullptr)
   {
     error = "Options array is null";
     return false;
   }
 
-  setDefaultOptions(options);
+  setDefaultOptions(request.config);
 
   auto value_after_equals = [](std::string_view option, std::string_view prefix) -> std::string {
     return std::string(option.substr(prefix.size()));
   };
 
-  for (int i = 0; i < num_options; ++i)
+  for (size_t i = 0; i < num_options; ++i)
   {
     if (raw_options[i] == nullptr)
     {
@@ -415,80 +640,199 @@ static bool parseOptions(int num_options, const char* const* raw_options, Compil
     }
 
     std::string_view option(raw_options[i]);
-    if (option.starts_with("--cuda-path="))
+    std::string value;
+    if (option == "--device-ir")
     {
-      options.cuda_toolkit_path = value_after_equals(option, "--cuda-path=");
+      if (!setOutputKind(request, OutputKind::device_ir, error))
+      {
+        return false;
+      }
+    }
+    else if (option == "--ptx")
+    {
+      if (!setOutputKind(request, OutputKind::ptx, error))
+      {
+        return false;
+      }
+    }
+    else if (option == "--cubin")
+    {
+      if (!setOutputKind(request, OutputKind::cubin, error))
+      {
+        return false;
+      }
+    }
+    else if (option == "--fatbin")
+    {
+      if (!setOutputKind(request, OutputKind::fatbin, error))
+      {
+        return false;
+      }
+    }
+    else if (option == "--create-device-pch")
+    {
+      if (!setOutputKind(request, OutputKind::create_device_pch, error))
+      {
+        return false;
+      }
+    }
+    else if (option == "--create-host-pch")
+    {
+      if (!setOutputKind(request, OutputKind::create_host_pch, error))
+      {
+        return false;
+      }
+    }
+    else if (option == "-c" || option == "--compile")
+    {
+      if (!setOutputKind(request, OutputKind::compile, error))
+      {
+        return false;
+      }
+    }
+    else if (option == "--shared")
+    {
+      if (!setOutputKind(request, OutputKind::shared, error))
+      {
+        return false;
+      }
+    }
+    else if (option == "-o")
+    {
+      const char* output_path = nullptr;
+      if (!takeRequiredNext(i, num_options, raw_options, "-o", output_path, error))
+      {
+        return false;
+      }
+      request.output_path = output_path;
+    }
+    else if (option == "--input-source")
+    {
+      if (!parseSourceInput(i, num_options, raw_options, request, error))
+      {
+        return false;
+      }
+    }
+    else if (option == "--input-device-ir")
+    {
+      if (!parseMemoryInput(i, num_options, raw_options, option, request.device_ir_inputs, ".bc", error))
+      {
+        return false;
+      }
+    }
+    else if (option == "--input-ptx")
+    {
+      if (!parseMemoryInput(i, num_options, raw_options, option, request.ptx_inputs, ".ptx", error))
+      {
+        return false;
+      }
+    }
+    else if (option == "--input-cubin")
+    {
+      if (!parseMemoryInput(i, num_options, raw_options, option, request.cubin_inputs, ".cubin", error))
+      {
+        return false;
+      }
+    }
+    else if (option == "--input-ltoir")
+    {
+      if (!parseMemoryInput(i, num_options, raw_options, option, request.ltoir_inputs, ".ltoir", error))
+      {
+        return false;
+      }
+    }
+    else if (takeOptionValue(option, "--input-object", i, num_options, raw_options, value, error))
+    {
+      request.object_paths.push_back(value);
+      request.link_input_paths.push_back(value);
+    }
+    else if (takeOptionValue(option, "--input-archive", i, num_options, raw_options, value, error))
+    {
+      request.archive_paths.push_back(value);
+      request.link_input_paths.push_back(value);
+    }
+    else if (takeOptionValue(option, "--device-pch", i, num_options, raw_options, value, error))
+    {
+      request.config.device_pch_path = value;
+    }
+    else if (takeOptionValue(option, "--host-pch", i, num_options, raw_options, value, error))
+    {
+      request.config.host_pch_path = value;
+    }
+    else if (takeOptionValue(option, "--pch-source-path", i, num_options, raw_options, value, error))
+    {
+      request.pch_source_path = value;
+    }
+    else if (takeOptionValue(option, "--source-name", i, num_options, raw_options, value, error))
+    {
+      request.source_name = value;
+    }
+    else if (option.starts_with("--cuda-path="))
+    {
+      request.config.cuda_toolkit_path = value_after_equals(option, "--cuda-path=");
     }
     else if (option.starts_with("--hostjit-include-path="))
     {
-      options.hostjit_include_path = value_after_equals(option, "--hostjit-include-path=");
+      request.config.hostjit_include_path = value_after_equals(option, "--hostjit-include-path=");
     }
     else if (option.starts_with("--clang-headers-path="))
     {
-      options.clang_headers_path = value_after_equals(option, "--clang-headers-path=");
+      request.config.clang_headers_path = value_after_equals(option, "--clang-headers-path=");
     }
     else if (option.starts_with("--system-include-path="))
     {
-      options.system_include_paths.push_back(value_after_equals(option, "--system-include-path="));
+      request.config.system_include_paths.push_back(value_after_equals(option, "--system-include-path="));
     }
     else if (option.starts_with("-isystem") && option.size() > 8)
     {
-      options.system_include_paths.emplace_back(option.substr(8));
+      request.config.system_include_paths.emplace_back(option.substr(8));
     }
     else if (option == "-isystem")
     {
-      if (++i >= num_options || raw_options[i] == nullptr)
+      const char* include_path = nullptr;
+      if (!takeRequiredNext(i, num_options, raw_options, "-isystem", include_path, error))
       {
-        error = "-isystem requires an argument";
         return false;
       }
-      options.system_include_paths.emplace_back(raw_options[i]);
+      request.config.system_include_paths.emplace_back(include_path);
     }
     else if (option.starts_with("--include-path="))
     {
-      options.include_paths.push_back(value_after_equals(option, "--include-path="));
+      request.config.include_paths.push_back(value_after_equals(option, "--include-path="));
     }
     else if (option.starts_with("-I") && option.size() > 2)
     {
-      options.include_paths.emplace_back(option.substr(2));
+      request.config.include_paths.emplace_back(option.substr(2));
     }
     else if (option == "-I")
     {
-      if (++i >= num_options || raw_options[i] == nullptr)
+      const char* include_path = nullptr;
+      if (!takeRequiredNext(i, num_options, raw_options, "-I", include_path, error))
       {
-        error = "-I requires an argument";
         return false;
       }
-      options.include_paths.emplace_back(raw_options[i]);
+      request.config.include_paths.emplace_back(include_path);
     }
     else if (option.starts_with("--library-path="))
     {
-      options.library_paths.push_back(value_after_equals(option, "--library-path="));
+      request.config.library_paths.push_back(value_after_equals(option, "--library-path="));
     }
     else if (option.starts_with("-L") && option.size() > 2)
     {
-      options.library_paths.emplace_back(option.substr(2));
+      request.config.library_paths.emplace_back(option.substr(2));
     }
     else if (option == "-L")
     {
-      if (++i >= num_options || raw_options[i] == nullptr)
+      const char* library_path = nullptr;
+      if (!takeRequiredNext(i, num_options, raw_options, "-L", library_path, error))
       {
-        error = "-L requires an argument";
         return false;
       }
-      options.library_paths.emplace_back(raw_options[i]);
-    }
-    else if (option.starts_with("--device-bitcode="))
-    {
-      options.device_bitcode_files.push_back(value_after_equals(option, "--device-bitcode="));
-    }
-    else if (option.starts_with("--device-ltoir="))
-    {
-      options.device_ltoir_files.push_back(value_after_equals(option, "--device-ltoir="));
+      request.config.library_paths.emplace_back(library_path);
     }
     else if (option.starts_with("--define-macro="))
     {
-      if (!parseMacroDefinition(value_after_equals(option, "--define-macro="), options))
+      if (!parseMacroDefinition(value_after_equals(option, "--define-macro="), request.config))
       {
         error = "Invalid macro definition: " + std::string(option);
         return false;
@@ -496,7 +840,7 @@ static bool parseOptions(int num_options, const char* const* raw_options, Compil
     }
     else if (option.starts_with("-D") && option.size() > 2)
     {
-      if (!parseMacroDefinition(std::string(option.substr(2)), options))
+      if (!parseMacroDefinition(std::string(option.substr(2)), request.config))
       {
         error = "Invalid macro definition: " + std::string(option);
         return false;
@@ -504,7 +848,9 @@ static bool parseOptions(int num_options, const char* const* raw_options, Compil
     }
     else if (option == "-D")
     {
-      if (++i >= num_options || raw_options[i] == nullptr || !parseMacroDefinition(raw_options[i], options))
+      const char* macro_definition = nullptr;
+      if (!takeRequiredNext(i, num_options, raw_options, "-D", macro_definition, error)
+          || !parseMacroDefinition(macro_definition, request.config))
       {
         error = "-D requires a macro definition";
         return false;
@@ -512,7 +858,7 @@ static bool parseOptions(int num_options, const char* const* raw_options, Compil
     }
     else if (option.starts_with("--gpu-architecture="))
     {
-      if (!parseGpuArchitecture(value_after_equals(option, "--gpu-architecture="), options.sm_version))
+      if (!parseGpuArchitecture(value_after_equals(option, "--gpu-architecture="), request.config.sm_version))
       {
         error = "Invalid GPU architecture: " + std::string(option);
         return false;
@@ -520,7 +866,7 @@ static bool parseOptions(int num_options, const char* const* raw_options, Compil
     }
     else if (option.starts_with("--optimization-level="))
     {
-      if (!parseInt(value_after_equals(option, "--optimization-level="), options.optimization_level))
+      if (!parseInt(value_after_equals(option, "--optimization-level="), request.config.optimization_level))
       {
         error = "Invalid optimization level: " + std::string(option);
         return false;
@@ -528,7 +874,7 @@ static bool parseOptions(int num_options, const char* const* raw_options, Compil
     }
     else if (option.starts_with("-O") && option.size() > 2)
     {
-      if (!parseInt(std::string(option.substr(2)), options.optimization_level))
+      if (!parseInt(std::string(option.substr(2)), request.config.optimization_level))
       {
         error = "Invalid optimization level: " + std::string(option);
         return false;
@@ -536,44 +882,36 @@ static bool parseOptions(int num_options, const char* const* raw_options, Compil
     }
     else if (option == "--debug")
     {
-      options.debug = true;
+      request.config.debug = true;
     }
     else if (option == "--verbose")
     {
-      options.verbose = true;
+      request.config.verbose = true;
     }
     else if (option == "--trace-includes")
     {
-      options.trace_includes = true;
+      request.config.trace_includes = true;
     }
     else if (option == "--keep-artifacts")
     {
-      options.keep_artifacts = true;
+      request.config.keep_artifacts = true;
     }
     else if (option.starts_with("--entry-point="))
     {
-      options.entry_point_name = value_after_equals(option, "--entry-point=");
-    }
-    else if (option.starts_with("--device-pch="))
-    {
-      options.device_pch_path = value_after_equals(option, "--device-pch=");
-    }
-    else if (option.starts_with("--host-pch="))
-    {
-      options.host_pch_path = value_after_equals(option, "--host-pch=");
+      request.config.entry_point_name = value_after_equals(option, "--entry-point=");
     }
     else if (option.starts_with("-XClang="))
     {
-      options.extra_clang_args.emplace_back(option.substr(8));
+      request.config.extra_clang_args.emplace_back(option.substr(8));
     }
     else if (option == "-XClang")
     {
-      if (++i >= num_options || raw_options[i] == nullptr)
+      const char* clang_arg = nullptr;
+      if (!takeRequiredNext(i, num_options, raw_options, "-XClang", clang_arg, error))
       {
-        error = "-XClang requires an argument";
         return false;
       }
-      options.extra_clang_args.emplace_back(raw_options[i]);
+      request.config.extra_clang_args.emplace_back(clang_arg);
     }
     else
     {
@@ -582,9 +920,9 @@ static bool parseOptions(int num_options, const char* const* raw_options, Compil
     }
   }
 
-  if (options.library_paths.empty())
+  if (request.config.library_paths.empty())
   {
-    addDefaultCudaLibraryPath(options);
+    addDefaultCudaLibraryPath(request.config);
   }
 
   return true;
@@ -656,29 +994,6 @@ static bool validateOptions(const CompilerOptions& options, std::string* error_m
     }
   }
 
-  for (const auto& bitcode_path : options.device_bitcode_files)
-  {
-    if (!pathExists(bitcode_path))
-    {
-      if (error_message)
-      {
-        *error_message = "Device bitcode path does not exist: " + bitcode_path;
-      }
-      return false;
-    }
-  }
-
-  for (const auto& ltoir_path : options.device_ltoir_files)
-  {
-    if (!pathExists(ltoir_path))
-    {
-      if (error_message)
-      {
-        *error_message = "Device LTOIR path does not exist: " + ltoir_path;
-      }
-      return false;
-    }
-  }
 
   if (!options.device_pch_path.empty() && !pathExists(options.device_pch_path))
   {
@@ -718,6 +1033,228 @@ static bool validateOptions(const CompilerOptions& options, std::string* error_m
   }
 
   return true;
+}
+
+static bool requireNoOutputPath(const CompileRequest& request, std::string& error)
+{
+  if (!request.output_path.empty())
+  {
+    error = "-o is invalid for the selected output kind";
+    return false;
+  }
+  return true;
+}
+
+static bool requireOutputPath(const CompileRequest& request, std::string& error)
+{
+  if (request.output_path.empty())
+  {
+    error = "-o <path> is required for the selected output kind";
+    return false;
+  }
+  return true;
+}
+
+static bool requireSource(const CompileRequest& request, std::string& error)
+{
+  if (!request.has_source)
+  {
+    error = "--input-source is required for the selected output kind";
+    return false;
+  }
+  return true;
+}
+
+static bool rejectSharedInputs(const CompileRequest& request, std::string& error)
+{
+  if (!request.object_paths.empty() || !request.archive_paths.empty())
+  {
+    error = "Host object and archive inputs are valid only with --shared";
+    return false;
+  }
+  return true;
+}
+
+static bool rejectDeviceMemoryInputs(const CompileRequest& request, std::string& error)
+{
+  if (!request.device_ir_inputs.empty() || !request.ptx_inputs.empty() || !request.cubin_inputs.empty()
+      || !request.ltoir_inputs.empty())
+  {
+    error = "Device memory inputs are invalid for the selected output kind";
+    return false;
+  }
+  return true;
+}
+
+static bool validateCompileRequest(const CompileRequest& request, std::string& error, cudaccResult& result)
+{
+  result = CUDACC_ERROR_INVALID_INPUT;
+
+  if (request.output_kind == OutputKind::none)
+  {
+    error = "Exactly one output kind option is required";
+    return false;
+  }
+  if (request.source_name.empty())
+  {
+    error = "--source-name must be non-empty";
+    return false;
+  }
+  std::string config_error;
+  if (!validateOptions(request.config, &config_error))
+  {
+    error = "Configuration error: " + config_error;
+    return false;
+  }
+
+  for (const auto& path : request.object_paths)
+  {
+    if (path.empty())
+    {
+      error = "--input-object path must be non-empty";
+      return false;
+    }
+  }
+  for (const auto& path : request.archive_paths)
+  {
+    if (path.empty())
+    {
+      error = "--input-archive path must be non-empty";
+      return false;
+    }
+  }
+
+  if (!request.config.device_pch_path.empty()
+      && (request.output_kind == OutputKind::shared || request.output_kind == OutputKind::create_host_pch))
+  {
+    error = "--device-pch is invalid for the selected output kind";
+    return false;
+  }
+  if (!request.config.host_pch_path.empty()
+      && request.output_kind != OutputKind::compile && request.output_kind != OutputKind::create_host_pch)
+  {
+    error = "--host-pch is invalid for the selected output kind";
+    return false;
+  }
+
+  switch (request.output_kind)
+  {
+    case OutputKind::device_ir:
+      if (!requireSource(request, error) || !requireNoOutputPath(request, error) || !rejectSharedInputs(request, error))
+      {
+        return false;
+      }
+      if (!request.device_ir_inputs.empty() || !request.ptx_inputs.empty() || !request.cubin_inputs.empty()
+          || !request.ltoir_inputs.empty())
+      {
+        error = "Device memory inputs are invalid with --device-ir";
+        return false;
+      }
+      return true;
+
+    case OutputKind::ptx:
+      if (!requireSource(request, error) || !requireNoOutputPath(request, error) || !rejectSharedInputs(request, error))
+      {
+        return false;
+      }
+      if (!request.ptx_inputs.empty() || !request.cubin_inputs.empty() || !request.ltoir_inputs.empty())
+      {
+        error = "--input-ptx, --input-cubin, and --input-ltoir are invalid with --ptx";
+        return false;
+      }
+      return true;
+
+    case OutputKind::cubin:
+    case OutputKind::fatbin:
+      if (!requireNoOutputPath(request, error) || !rejectSharedInputs(request, error))
+      {
+        return false;
+      }
+      if (!request.has_source && !request.device_ir_inputs.empty())
+      {
+        error = "--input-device-ir requires --input-source";
+        return false;
+      }
+      if (!request.has_source && request.ptx_inputs.empty() && request.cubin_inputs.empty() && request.ltoir_inputs.empty())
+      {
+        error = "At least one source, PTX, cubin, or LTOIR input is required";
+        return false;
+      }
+      return true;
+
+    case OutputKind::create_device_pch:
+      if (!requireSource(request, error) || !requireOutputPath(request, error) || !rejectSharedInputs(request, error)
+          || !rejectDeviceMemoryInputs(request, error))
+      {
+        return false;
+      }
+      if (request.pch_source_path.empty())
+      {
+        error = "--pch-source-path is required for PCH creation";
+        return false;
+      }
+      if (!request.config.host_pch_path.empty())
+      {
+        error = "--host-pch is invalid with --create-device-pch";
+        return false;
+      }
+      return true;
+
+    case OutputKind::create_host_pch:
+      if (!requireSource(request, error) || !requireOutputPath(request, error) || !rejectSharedInputs(request, error)
+          || !rejectDeviceMemoryInputs(request, error))
+      {
+        return false;
+      }
+      if (request.pch_source_path.empty())
+      {
+        error = "--pch-source-path is required for PCH creation";
+        return false;
+      }
+      if (!request.config.device_pch_path.empty())
+      {
+        error = "--device-pch is invalid with --create-host-pch";
+        return false;
+      }
+      return true;
+
+    case OutputKind::compile:
+      if (!requireSource(request, error) || !requireOutputPath(request, error) || !rejectSharedInputs(request, error))
+      {
+        return false;
+      }
+      if (!request.ptx_inputs.empty() || !request.cubin_inputs.empty())
+      {
+        error = "--input-ptx and --input-cubin are invalid with --compile";
+        return false;
+      }
+      return true;
+
+    case OutputKind::shared:
+      if (!requireOutputPath(request, error))
+      {
+        return false;
+      }
+      if (request.has_source || !request.pch_source_path.empty() || !request.config.device_pch_path.empty()
+          || !request.config.host_pch_path.empty() || !request.device_ir_inputs.empty() || !request.ptx_inputs.empty()
+          || !request.cubin_inputs.empty() || !request.ltoir_inputs.empty())
+      {
+        error = "--shared accepts only host object/archive path inputs and link options";
+        return false;
+      }
+      if (request.object_paths.empty() && request.archive_paths.empty())
+      {
+        error = "--shared requires at least one --input-object or --input-archive";
+        return false;
+      }
+      return true;
+
+    case OutputKind::none:
+      break;
+  }
+
+  error = "Unhandled output kind";
+  return false;
 }
 
 static void appendExtraClangArgs(std::vector<std::string>& args, const CompilerOptions& options)
@@ -1119,17 +1656,7 @@ class CompilerImpl
 public:
   CompilerImpl() {}
 
-  // Write preamble to a persistent file and generate a PCH from it.
-  // Concurrent builds - other threads, or other processes sharing the
-  // persistent cache directory - may generate the same artifacts at the same
-  // time. All writes therefore go to a writer-unique temporary path followed
-  // by an atomic rename, so readers only ever observe complete files, and
-  // since the content is deterministic for a given path, whichever writer
-  // lands last is correct. The preamble is additionally left untouched when
-  // its content already matches: the PCH records the preamble file's
-  // identity, so a needless rewrite would invalidate concurrently generated
-  // PCHs.
-  bool generatePCH(const std::string& pch_source,
+  bool generatePCH(std::span<const char> pch_source,
                    const std::string& pch_source_path,
                    const std::string& pch_output_path,
                    std::vector<std::string> arg_strings,
@@ -1147,19 +1674,15 @@ public:
       {
         return false;
       }
-      std::stringstream contents;
-      contents << existing.rdbuf();
-      return contents.str() == pch_source;
+      std::vector<char> contents((std::istreambuf_iterator<char>(existing)), std::istreambuf_iterator<char>());
+      return contents.size() == pch_source.size()
+          && std::memcmp(contents.data(), pch_source.data(), pch_source.size()) == 0;
     };
 
     if (!preamble_matches())
     {
       const std::string source_temp_path = pch_source_path + temp_suffix;
-      if (!writeFile(
-            source_temp_path,
-            llvm::ArrayRef<char>{pch_source.data(), pch_source.size()},
-            diagnostics,
-            "Failed to write PCH preamble to " + source_temp_path))
+      if (!writeFile(source_temp_path, pch_source, diagnostics, "Failed to write PCH preamble to " + source_temp_path))
       {
         return false;
       }
@@ -1215,8 +1738,6 @@ public:
     {
       std::error_code ignored;
       std::filesystem::remove(output_temp_path, ignored);
-      // A concurrent writer may have landed the (identical) PCH first; that
-      // counts as success for this builder too.
       if (!pathExists(pch_output_path))
       {
         diagnostics += "Failed to move PCH into place: " + rename_error.message();
@@ -1227,30 +1748,28 @@ public:
   }
 
   llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem>
-  createVFSWithSource(const std::string& source_code, const std::string& virtual_path)
+  createVFSWithSource(std::span<const char> source_code, llvm::StringRef virtual_path)
   {
     auto mem_fs = llvm::makeIntrusiveRefCnt<llvm::vfs::InMemoryFileSystem>();
-    mem_fs->addFile(virtual_path, 0, llvm::MemoryBuffer::getMemBuffer(source_code));
+    mem_fs->addFile(
+      virtual_path,
+      0,
+      llvm::MemoryBuffer::getMemBufferCopy(llvm::StringRef(source_code.data(), source_code.size()), virtual_path));
 
     auto overlay = llvm::makeIntrusiveRefCnt<llvm::vfs::OverlayFileSystem>(llvm::vfs::getRealFileSystem());
     overlay->pushOverlay(mem_fs);
     return overlay;
   }
 
-  bool compileDeviceToPTX(
-    const std::string& source_code,
-    const std::string& input_file,
-    const std::string& output_ptx,
-    const CompilerOptions& config,
-    std::string& diagnostics)
+  DeviceModuleResult compileSourceToDeviceModule(std::span<const char> source_code,
+                                                 const std::string& source_file,
+                                                 const CompilerOptions& config)
   {
-    std::string temp_dir    = std::filesystem::path(output_ptx).parent_path().string();
-    std::string source_file = temp_dir + "/" + input_file;
-
-    std::vector<std::string> bitcode_files_to_link = config.device_bitcode_files;
+    DeviceModuleResult result;
+    result.context = std::make_unique<llvm::LLVMContext>();
 
     std::vector<std::string> driver_arg_strings;
-    appendCommonClangDriverArgs(driver_arg_strings, source_file, output_ptx, config, /*is_device=*/true);
+    appendCommonClangDriverArgs(driver_arg_strings, source_file, {}, config, /*is_device=*/true);
 
     auto setup = createClangCompilerSetup(
       std::move(driver_arg_strings),
@@ -1258,274 +1777,277 @@ public:
       config.device_pch_path,
       config,
       "Device",
-      diagnostics,
+      result.diagnostics,
       "\nFailed to create device compiler invocation");
     if (!setup)
     {
-      return false;
+      return result;
     }
 
     auto& compiler = setup->compiler;
-    compiler.getFrontendOpts().OutputFile = output_ptx;
 
     if (config.trace_includes)
     {
-      diagnostics += "\n=== Device Header Search Paths ===\n";
+      result.diagnostics += "\n=== Device Header Search Paths ===\n";
       const auto& hso = setup->invocation().getHeaderSearchOpts();
       for (const auto& entry : hso.UserEntries)
       {
-        diagnostics += "  " + entry.Path + "\n";
+        result.diagnostics += "  " + entry.Path + "\n";
       }
-      diagnostics += "=== End Header Search Paths ===\n\n";
+      result.diagnostics += "=== End Header Search Paths ===\n\n";
     }
 
-    llvm::LLVMContext llvm_context;
-
-    clang::EmitLLVMOnlyAction emit_llvm_action(&llvm_context);
-    bool success = runWithLargeStack([&] {
+    clang::EmitLLVMOnlyAction emit_llvm_action(result.context.get());
+    const bool success = runWithLargeStack([&] {
       return compiler.ExecuteAction(emit_llvm_action);
     });
 
     if (config.trace_includes && compiler.hasSourceManager())
     {
-      diagnostics += "\n=== Device Included Files ===\n";
+      result.diagnostics += "\n=== Device Included Files ===\n";
       auto& sm = compiler.getSourceManager();
       for (auto it = sm.fileinfo_begin(); it != sm.fileinfo_end(); ++it)
       {
-        diagnostics += "  " + it->first.getName().str() + "\n";
+        result.diagnostics += "  " + it->first.getName().str() + "\n";
       }
-      diagnostics += "=== End Included Files ===\n\n";
+      result.diagnostics += "=== End Included Files ===\n\n";
     }
 
-    if (success)
+    setup->appendDiagnosticsTo(result.diagnostics);
+
+    if (!success)
     {
-      std::unique_ptr<llvm::Module> mod = emit_llvm_action.takeModule();
-      if (mod)
-      {
-        for (const auto& bc_file : bitcode_files_to_link)
-        {
-          llvm::SMDiagnostic err;
-          auto bc_mod = llvm::parseIRFile(bc_file, err, llvm_context);
-          if (bc_mod)
-          {
-            if (llvm::Linker::linkModules(*mod, std::move(bc_mod)))
-            {
-              diagnostics += "Failed to link bitcode: " + bc_file + "\n";
-              success = false;
-              break;
-            }
-          }
-          else
-          {
-            std::string err_msg;
-            llvm::raw_string_ostream err_stream(err_msg);
-            err.print("hostjit", err_stream);
-            diagnostics += "Failed to parse bitcode: " + bc_file + "\n" + err_msg + "\n";
-            success = false;
-            break;
-          }
-        }
-
-        // Re-link libdevice to resolve any new references (e.g. __nv_pow)
-        // introduced by the extra bitcode modules.
-        if (success && !bitcode_files_to_link.empty())
-        {
-          std::string libdevice_path = config.cuda_toolkit_path + "/nvvm/libdevice/libdevice.10.bc";
-          llvm::SMDiagnostic err;
-          auto libdevice = llvm::parseIRFile(libdevice_path, err, llvm_context);
-          if (libdevice)
-          {
-            // Use AppendToUsed to avoid internalization issues
-            llvm::Linker::linkModules(*mod, std::move(libdevice), llvm::Linker::LinkOnlyNeeded);
-          }
-        }
-
-        if (success)
-        {
-          std::string err_str;
-          const llvm::Target* target = llvm::TargetRegistry::lookupTarget(mod->getTargetTriple(), err_str);
-          if (target)
-          {
-            llvm::TargetOptions opt;
-            auto tm = target->createTargetMachine(
-              mod->getTargetTriple(),
-              "sm_" + std::to_string(config.sm_version),
-              "+ptx" + std::to_string(ptxVersionForSM(config.sm_version)),
-              opt,
-              llvm::Reloc::PIC_);
-            if (tm)
-            {
-              mod->setDataLayout(tm->createDataLayout());
-
-              // Run optimization passes after linking to inline user-provided
-              // operations (from bitcode or embedded C++ source).
-              if (!config.entry_point_name.empty())
-              {
-                // Internalize all functions except the entry point and
-                // GPU kernels, so the optimizer can inline the linked
-                // bitcode functions.
-                for (auto& F : *mod)
-                {
-                  if (!F.isDeclaration() && F.getLinkage() == llvm::GlobalValue::ExternalLinkage
-                      && F.getName() != config.entry_point_name && F.getCallingConv() != llvm::CallingConv::PTX_Kernel)
-                  {
-                    F.setLinkage(llvm::GlobalValue::InternalLinkage);
-                    // Remove attributes that conflict with inlining
-                    F.removeFnAttr(llvm::Attribute::NoInline);
-                    F.removeFnAttr(llvm::Attribute::OptimizeNone);
-                    F.addFnAttr(llvm::Attribute::AlwaysInline);
-                  }
-                }
-
-                llvm::OptimizationLevel opt_level;
-                switch (config.optimization_level)
-                {
-                  case 0:
-                    opt_level = llvm::OptimizationLevel::O0;
-                    break;
-                  case 1:
-                    opt_level = llvm::OptimizationLevel::O1;
-                    break;
-                  case 3:
-                    opt_level = llvm::OptimizationLevel::O3;
-                    break;
-                  default:
-                    opt_level = llvm::OptimizationLevel::O2;
-                    break;
-                }
-
-                // Raise LLVM's loop-unroll thresholds (once) so the user op's
-                // small, constant-trip-count loops -- e.g. Numba `local.array`
-                // loops -- get FULLY unrolled. Without full unroll the backing
-                // alloca keeps a dynamic index, SROA can't promote it, and it
-                // lands in local memory (a per-thread stack frame + LDL/STL
-                // traffic). ptxas does this promotion on the v1/LTO path; the
-                // LLVM-NVPTX path needs full-unroll-then-SROA at the IR level.
-                static const bool unroll_tuned = [] {
-                  auto& opts   = llvm::cl::getRegisteredOptions();
-                  auto set_opt = [&](llvm::StringRef name, llvm::StringRef value) {
-                    auto it = opts.find(name);
-                    if (it != opts.end())
-                    {
-                      it->second->addOccurrence(0, name, value);
-                    }
-                  };
-                  set_opt("unroll-threshold", "4000");
-                  set_opt("unroll-full-max-count", "1024");
-                  set_opt("unroll-max-upperbound", "1024");
-                  return true;
-                }();
-                (void) unroll_tuned;
-
-                llvm::LoopAnalysisManager LAM;
-                llvm::FunctionAnalysisManager FAM;
-                llvm::CGSCCAnalysisManager CGAM;
-                llvm::ModuleAnalysisManager MAM;
-
-                llvm::PassBuilder PB(tm);
-                PB.registerModuleAnalyses(MAM);
-                PB.registerCGSCCAnalyses(CGAM);
-                PB.registerFunctionAnalyses(FAM);
-                PB.registerLoopAnalyses(LAM);
-                PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-
-                auto MPM = PB.buildPerModuleDefaultPipeline(opt_level);
-                MPM.run(*mod, MAM);
-
-                // Second optimization round with fresh analyses: now that the
-                // op's loops are fully unrolled (constant indices), the early
-                // SROA in the pipeline promotes the local arrays to registers.
-                llvm::LoopAnalysisManager LAM2;
-                llvm::FunctionAnalysisManager FAM2;
-                llvm::CGSCCAnalysisManager CGAM2;
-                llvm::ModuleAnalysisManager MAM2;
-
-                llvm::PassBuilder PB2(tm);
-                PB2.registerModuleAnalyses(MAM2);
-                PB2.registerCGSCCAnalyses(CGAM2);
-                PB2.registerFunctionAnalyses(FAM2);
-                PB2.registerLoopAnalyses(LAM2);
-                PB2.crossRegisterProxies(LAM2, FAM2, CGAM2, MAM2);
-
-                auto MPM2 = PB2.buildPerModuleDefaultPipeline(opt_level);
-                MPM2.run(*mod, MAM2);
-              }
-
-              std::error_code EC;
-              llvm::raw_fd_ostream dest(output_ptx, EC);
-              if (!EC)
-              {
-                llvm::legacy::PassManager pass;
-                tm->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::AssemblyFile);
-                pass.run(*mod);
-                dest.flush();
-
-                // Debug: when CUDACC_DUMP_DIR is set, dump the optimized IR
-                // and the PTX fed to ptxas, keyed by entry point name. Lets us
-                // inspect codegen (register pressure, launch bounds) post-inline.
-                if (const char* dump_dir = std::getenv("CUDACC_DUMP_DIR"))
-                {
-                  std::error_code dec;
-                  std::filesystem::create_directories(dump_dir, dec);
-                  const std::string base =
-                    config.entry_point_name.empty() ? std::string("kernel") : config.entry_point_name;
-                  const std::string stem = (std::filesystem::path(dump_dir) / base).string();
-                  llvm::raw_fd_ostream ll_os(stem + ".opt.ll", dec);
-                  if (!dec)
-                  {
-                    mod->print(ll_os, nullptr);
-                  }
-                  std::error_code cec;
-                  std::filesystem::copy_file(
-                    output_ptx, stem + ".ptx", std::filesystem::copy_options::overwrite_existing, cec);
-                  llvm::errs() << "[hostjit] dumped " << stem << ".opt.ll and " << stem << ".ptx\n";
-                }
-              }
-              else
-              {
-                diagnostics += "Failed to open output file: " + output_ptx + "\n";
-                success = false;
-              }
-            }
-            else
-            {
-              diagnostics += "Failed to create target machine\n";
-              success = false;
-            }
-          }
-          else
-          {
-            diagnostics += "Failed to lookup target: " + err_str + "\n";
-            success = false;
-          }
-        }
-      }
-    }
-
-    setup->appendDiagnosticsTo(diagnostics);
-
-    return success;
-  }
-
-  BitcodeResult compileToDeviceBitcode(
-    const std::string& source_code,
-    const std::string& input_name,
-    const std::string& output_bitcode_path,
-    const CompilerOptions& config)
-  {
-    BitcodeResult result;
-
-    std::string error_msg;
-    if (!validateOptions(config, &error_msg))
-    {
-      result.diagnostics = "Configuration error: " + error_msg;
       return result;
     }
 
-    initialize_llvm();
+    result.module = emit_llvm_action.takeModule();
+    if (!result.module)
+    {
+      result.diagnostics += "Failed to get LLVM module";
+      return result;
+    }
+
+    result.success = true;
+    return result;
+  }
+
+  bool linkDeviceIRInputs(llvm::Module& mod,
+                          llvm::LLVMContext& llvm_context,
+                          const std::vector<MemoryInput>& bitcode_inputs,
+                          const CompilerOptions& config,
+                          std::string& diagnostics)
+  {
+    for (const auto& input : bitcode_inputs)
+    {
+      llvm::SMDiagnostic err;
+      llvm::MemoryBufferRef buffer_ref(
+        llvm::StringRef(input.data.data(), input.data.size()), input.generated_name);
+      auto bc_mod = llvm::parseIR(buffer_ref, err, llvm_context);
+      if (!bc_mod)
+      {
+        std::string err_msg;
+        llvm::raw_string_ostream err_stream(err_msg);
+        err.print("cudacc", err_stream);
+        diagnostics += "Failed to parse bitcode: " + input.generated_name + "\n" + err_msg + "\n";
+        return false;
+      }
+
+      if (llvm::Linker::linkModules(mod, std::move(bc_mod)))
+      {
+        diagnostics += "Failed to link bitcode: " + input.generated_name + "\n";
+        return false;
+      }
+    }
+
+    if (!bitcode_inputs.empty())
+    {
+      std::string libdevice_path = config.cuda_toolkit_path + "/nvvm/libdevice/libdevice.10.bc";
+      llvm::SMDiagnostic err;
+      auto libdevice = llvm::parseIRFile(libdevice_path, err, llvm_context);
+      if (libdevice)
+      {
+        llvm::Linker::linkModules(mod, std::move(libdevice), llvm::Linker::LinkOnlyNeeded);
+      }
+    }
+
+    return true;
+  }
+
+  std::unique_ptr<llvm::TargetMachine>
+  createTargetMachineForModule(llvm::Module& mod, const CompilerOptions& config, std::string& diagnostics)
+  {
+    std::string err_str;
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(mod.getTargetTriple(), err_str);
+    if (!target)
+    {
+      diagnostics += "Failed to lookup target: " + err_str + "\n";
+      return nullptr;
+    }
+
+    llvm::TargetOptions opt;
+    std::unique_ptr<llvm::TargetMachine> tm(target->createTargetMachine(
+      mod.getTargetTriple(),
+      "sm_" + std::to_string(config.sm_version),
+      "+ptx" + std::to_string(ptxVersionForSM(config.sm_version)),
+      opt,
+      llvm::Reloc::PIC_));
+    if (!tm)
+    {
+      diagnostics += "Failed to create target machine\n";
+      return nullptr;
+    }
+
+    mod.setDataLayout(tm->createDataLayout());
+    return tm;
+  }
+
+  void optimizeDeviceModuleForEntryPoint(
+    llvm::Module& mod, llvm::TargetMachine& tm, const CompilerOptions& config, bool force_optimization)
+  {
+    if (!force_optimization && config.entry_point_name.empty())
+    {
+      return;
+    }
+
+    if (!config.entry_point_name.empty())
+    {
+      for (auto& F : mod)
+      {
+        if (!F.isDeclaration() && F.getLinkage() == llvm::GlobalValue::ExternalLinkage
+            && F.getName() != config.entry_point_name && F.getCallingConv() != llvm::CallingConv::PTX_Kernel)
+        {
+          F.setLinkage(llvm::GlobalValue::InternalLinkage);
+          F.removeFnAttr(llvm::Attribute::NoInline);
+          F.removeFnAttr(llvm::Attribute::OptimizeNone);
+          F.addFnAttr(llvm::Attribute::AlwaysInline);
+        }
+      }
+    }
+
+    llvm::OptimizationLevel opt_level;
+    switch (config.optimization_level)
+    {
+      case 0:
+        opt_level = llvm::OptimizationLevel::O0;
+        break;
+      case 1:
+        opt_level = llvm::OptimizationLevel::O1;
+        break;
+      case 3:
+        opt_level = llvm::OptimizationLevel::O3;
+        break;
+      default:
+        opt_level = llvm::OptimizationLevel::O2;
+        break;
+    }
+
+    static const bool unroll_tuned = [] {
+      auto& opts   = llvm::cl::getRegisteredOptions();
+      auto set_opt = [&](llvm::StringRef name, llvm::StringRef value) {
+        auto it = opts.find(name);
+        if (it != opts.end())
+        {
+          it->second->addOccurrence(0, name, value);
+        }
+      };
+      set_opt("unroll-threshold", "4000");
+      set_opt("unroll-full-max-count", "1024");
+      set_opt("unroll-max-upperbound", "1024");
+      return true;
+    }();
+    (void) unroll_tuned;
+
+    auto run_pipeline = [&](llvm::Module& module) {
+      llvm::LoopAnalysisManager LAM;
+      llvm::FunctionAnalysisManager FAM;
+      llvm::CGSCCAnalysisManager CGAM;
+      llvm::ModuleAnalysisManager MAM;
+
+      llvm::PassBuilder PB(&tm);
+      PB.registerModuleAnalyses(MAM);
+      PB.registerCGSCCAnalyses(CGAM);
+      PB.registerFunctionAnalyses(FAM);
+      PB.registerLoopAnalyses(LAM);
+      PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+      auto MPM = PB.buildPerModuleDefaultPipeline(opt_level);
+      MPM.run(module, MAM);
+    };
+
+    run_pipeline(mod);
+    run_pipeline(mod);
+  }
+
+  bool writeDeviceIRToMemory(llvm::Module& mod, std::vector<char>& bitcode, std::string& diagnostics)
+  {
+    llvm::SmallVector<char, 0> buffer;
+    llvm::raw_svector_ostream os(buffer);
+    llvm::WriteBitcodeToFile(mod, os);
+    bitcode.assign(buffer.begin(), buffer.end());
+    if (bitcode.empty())
+    {
+      diagnostics += "Failed to write device bitcode to memory";
+      return false;
+    }
+    return true;
+  }
+
+  bool emitPTXToMemory(llvm::Module& mod,
+                       const CompilerOptions& config,
+                       bool force_optimization,
+                       std::vector<char>& ptx,
+                       std::string& diagnostics)
+  {
+    auto tm = createTargetMachineForModule(mod, config, diagnostics);
+    if (!tm)
+    {
+      return false;
+    }
+
+    optimizeDeviceModuleForEntryPoint(mod, *tm, config, force_optimization);
+
+    llvm::SmallVector<char, 0> buffer;
+    llvm::raw_svector_ostream dest(buffer);
+    llvm::legacy::PassManager pass;
+    if (tm->addPassesToEmitFile(pass, dest, nullptr, llvm::CodeGenFileType::AssemblyFile))
+    {
+      diagnostics += "Target machine cannot emit PTX\n";
+      return false;
+    }
+    pass.run(mod);
+    ptx.assign(buffer.begin(), buffer.end());
+    if (ptx.empty())
+    {
+      diagnostics += "Failed to emit PTX\n";
+      return false;
+    }
+
+    if (const char* dump_dir = std::getenv("CUDACC_DUMP_DIR"))
+    {
+      std::error_code dec;
+      std::filesystem::create_directories(dump_dir, dec);
+      const std::string base = config.entry_point_name.empty() ? std::string("kernel") : config.entry_point_name;
+      const std::string stem = (std::filesystem::path(dump_dir) / base).string();
+      llvm::raw_fd_ostream ll_os(stem + ".opt.ll", dec);
+      if (!dec)
+      {
+        mod.print(ll_os, nullptr);
+      }
+      writeFile(stem + ".ptx", std::span<const char>{ptx.data(), ptx.size()}, diagnostics, "Failed to dump PTX");
+      llvm::errs() << "[hostjit] dumped " << stem << ".opt.ll and " << stem << ".ptx\n";
+    }
+
+    return true;
+  }
+
+  BitcodeResult compileToDeviceBitcode(std::span<const char> source_code,
+                                       const std::string& input_name,
+                                       const CompilerOptions& config)
+  {
+    BitcodeResult result;
 
     std::string temp_dir =
-      (tempDirectoryPath() / ("hostjit_bc_" + std::to_string(reinterpret_cast<uintptr_t>(this)))).string();
+      (tempDirectoryPath() / ("cudacc_bc_" + std::to_string(reinterpret_cast<uintptr_t>(this)))).string();
     if (!createDirectories(temp_dir, result.diagnostics))
     {
       return result;
@@ -1534,83 +2056,324 @@ public:
       removeAll(temp_dir);
     });
 
-    std::string input_file   = input_name.empty() ? std::string("input.cu") : input_name;
-    std::string source_file  = temp_dir + "/" + input_file;
+    const std::string input_file  = input_name.empty() ? std::string("input.cu") : input_name;
+    const std::string source_file = (std::filesystem::path(temp_dir) / input_file).string();
 
-    std::vector<std::string> driver_arg_strings;
-    appendCommonClangDriverArgs(
-      driver_arg_strings, source_file, output_bitcode_path, config, /*is_device=*/true);
-
-    auto setup = createClangCompilerSetup(
-      std::move(driver_arg_strings),
-      createVFSWithSource(source_code, source_file),
-      config.device_pch_path,
-      config,
-      "Device bitcode",
-      result.diagnostics,
-      "\nFailed to create compiler invocation");
-    if (!setup)
+    auto module_result = compileSourceToDeviceModule(source_code, source_file, config);
+    result.diagnostics += module_result.diagnostics;
+    if (!module_result)
     {
       return result;
     }
 
-    auto& compiler = setup->compiler;
-
-    llvm::LLVMContext llvm_context;
-    clang::EmitLLVMOnlyAction emit_llvm_action(&llvm_context);
-    bool success = runWithLargeStack([&] {
-      return compiler.ExecuteAction(emit_llvm_action);
-    });
-
-    if (success)
+    if (!writeDeviceIRToMemory(*module_result.module, result.bitcode, result.diagnostics))
     {
-      std::unique_ptr<llvm::Module> mod = emit_llvm_action.takeModule();
-      if (mod)
-      {
-        std::error_code ec;
-        llvm::raw_fd_ostream os(output_bitcode_path, ec, llvm::sys::fs::OF_None);
-        if (ec)
-        {
-          result.diagnostics = "Failed to open bitcode output file: " + output_bitcode_path + "\n";
-        }
-        else
-        {
-          llvm::WriteBitcodeToFile(*mod, os);
-          os.flush();
-          if (os.has_error())
-          {
-            result.diagnostics = "Failed to write bitcode output file: " + output_bitcode_path + "\n";
-          }
-          else
-          {
-            result.success = true;
-          }
-        }
-      }
-      else
-      {
-        result.diagnostics = "Failed to get LLVM module";
-      }
+      return result;
     }
 
-    setup->appendDiagnosticsTo(result.diagnostics);
     if (config.keep_artifacts)
     {
       cleanup_temp_dir.release();
     }
+    result.success = true;
     return result;
   }
 
-  bool compileHostCode(
-    const std::string& source_code,
-    const std::string& input_file,
-    const std::string& fatbin_path,
-    const std::string& output_obj,
-    const CompilerOptions& config,
-    std::string& diagnostics)
+  PtxResult compileToPTX(std::span<const char> source_code,
+                         const std::string& input_name,
+                         const std::vector<MemoryInput>& device_ir_inputs,
+                         const CompilerOptions& config)
+  {
+    PtxResult result;
+
+    std::string temp_dir =
+      (tempDirectoryPath() / ("cudacc_ptx_" + std::to_string(reinterpret_cast<uintptr_t>(this)))).string();
+    if (!createDirectories(temp_dir, result.diagnostics))
+    {
+      return result;
+    }
+    auto cleanup_temp_dir = llvm::scope_exit([&] {
+      removeAll(temp_dir);
+    });
+
+    const std::string input_file  = input_name.empty() ? std::string("input.cu") : input_name;
+    const std::string source_file = (std::filesystem::path(temp_dir) / input_file).string();
+
+    auto module_result = compileSourceToDeviceModule(source_code, source_file, config);
+    result.diagnostics += module_result.diagnostics;
+    if (!module_result)
+    {
+      return result;
+    }
+
+    if (!linkDeviceIRInputs(*module_result.module, *module_result.context, device_ir_inputs, config, result.diagnostics))
+    {
+      return result;
+    }
+
+    if (!emitPTXToMemory(*module_result.module, config, !device_ir_inputs.empty(), result.ptx, result.diagnostics))
+    {
+      return result;
+    }
+
+    if (config.keep_artifacts)
+    {
+      cleanup_temp_dir.release();
+    }
+    result.success = true;
+    return result;
+  }
+
+  void appendNvJitLinkErrorLog(nvJitLinkHandle jitlink_handle, std::string& diagnostics)
+  {
+    size_t log_size = 0;
+    nvJitLinkGetErrorLogSize(jitlink_handle, &log_size);
+    if (log_size > 1)
+    {
+      std::string log(log_size, '\0');
+      nvJitLinkGetErrorLog(jitlink_handle, log.data());
+      if (!log.empty() && log.back() == '\0')
+      {
+        log.pop_back();
+      }
+      diagnostics += "\n" + log;
+    }
+  }
+
+  CubinResult linkToCubin(std::span<const char> generated_ptx,
+                          const std::vector<MemoryInput>& ptx_inputs,
+                          const std::vector<MemoryInput>& cubin_inputs,
+                          const std::vector<MemoryInput>& ltoir_inputs,
+                          const CompilerOptions& config)
+  {
+    CubinResult result;
+
+    std::string arch_opt  = "-arch=sm_" + std::to_string(config.sm_version);
+    std::string opt_level = "-O" + std::to_string(config.optimization_level >= 1 ? 3 : 0);
+    std::vector<std::string> jitlink_option_strs{arch_opt, opt_level};
+    if (!ltoir_inputs.empty())
+    {
+      jitlink_option_strs.emplace_back("-lto");
+    }
+
+    std::vector<const char*> jitlink_options;
+    jitlink_options.reserve(jitlink_option_strs.size());
+    for (const auto& option : jitlink_option_strs)
+    {
+      jitlink_options.push_back(option.c_str());
+    }
+
+    nvJitLinkHandle jitlink_handle = nullptr;
+    nvJitLinkResult jlr =
+      nvJitLinkCreate(&jitlink_handle, static_cast<uint32_t>(jitlink_options.size()), jitlink_options.data());
+    if (jlr != NVJITLINK_SUCCESS)
+    {
+      result.diagnostics += "\nnvJitLinkCreate failed (error " + std::to_string(static_cast<int>(jlr)) + ")";
+      result.diagnostics += "\nnvJitLink options:";
+      for (const auto& option : jitlink_option_strs)
+      {
+        result.diagnostics += " " + option;
+      }
+      return result;
+    }
+    auto destroy_jitlink_handle = llvm::scope_exit([&] {
+      nvJitLinkDestroy(&jitlink_handle);
+    });
+
+    std::vector<std::vector<char>> ptx_storage;
+    ptx_storage.reserve((generated_ptx.empty() ? 0 : 1) + ptx_inputs.size());
+
+    auto add_ptx = [&](std::span<const char> ptx, const std::string& name) {
+      ptx_storage.emplace_back(ptx.begin(), ptx.end());
+      if (ptx_storage.back().empty() || ptx_storage.back().back() != '\0')
+      {
+        ptx_storage.back().push_back('\0');
+      }
+      jlr = nvJitLinkAddData(
+        jitlink_handle, NVJITLINK_INPUT_PTX, ptx_storage.back().data(), ptx_storage.back().size(), name.c_str());
+      if (jlr != NVJITLINK_SUCCESS)
+      {
+        appendNvJitLinkErrorLog(jitlink_handle, result.diagnostics);
+        result.diagnostics += "\nnvJitLinkAddData(PTX) failed for " + name;
+        return false;
+      }
+      return true;
+    };
+
+    if (!generated_ptx.empty() && !add_ptx(generated_ptx, "source.ptx"))
+    {
+      return result;
+    }
+    for (const auto& input : ptx_inputs)
+    {
+      if (!add_ptx(input.data, input.generated_name))
+      {
+        return result;
+      }
+    }
+    for (const auto& input : cubin_inputs)
+    {
+      jlr = nvJitLinkAddData(
+        jitlink_handle, NVJITLINK_INPUT_CUBIN, input.data.data(), input.data.size(), input.generated_name.c_str());
+      if (jlr != NVJITLINK_SUCCESS)
+      {
+        appendNvJitLinkErrorLog(jitlink_handle, result.diagnostics);
+        result.diagnostics += "\nnvJitLinkAddData(CUBIN) failed for " + input.generated_name;
+        return result;
+      }
+    }
+    for (const auto& input : ltoir_inputs)
+    {
+      jlr = nvJitLinkAddData(
+        jitlink_handle, NVJITLINK_INPUT_LTOIR, input.data.data(), input.data.size(), input.generated_name.c_str());
+      if (jlr != NVJITLINK_SUCCESS)
+      {
+        appendNvJitLinkErrorLog(jitlink_handle, result.diagnostics);
+        result.diagnostics += "\nnvJitLinkAddData(LTOIR) failed for " + input.generated_name;
+        return result;
+      }
+    }
+
+    jlr = nvJitLinkComplete(jitlink_handle);
+    if (jlr != NVJITLINK_SUCCESS)
+    {
+      appendNvJitLinkErrorLog(jitlink_handle, result.diagnostics);
+      result.diagnostics += "\nnvJitLinkComplete failed";
+      return result;
+    }
+
+    size_t cubin_size = 0;
+    jlr               = nvJitLinkGetLinkedCubinSize(jitlink_handle, &cubin_size);
+    if (jlr != NVJITLINK_SUCCESS || cubin_size == 0)
+    {
+      result.diagnostics += "\nnvJitLinkGetLinkedCubinSize failed";
+      return result;
+    }
+
+    result.cubin.resize(cubin_size);
+    jlr = nvJitLinkGetLinkedCubin(jitlink_handle, result.cubin.data());
+    if (jlr != NVJITLINK_SUCCESS)
+    {
+      result.diagnostics += "\nnvJitLinkGetLinkedCubin failed";
+      return result;
+    }
+
+    result.success = true;
+    return result;
+  }
+
+  FatbinResult createFatbin(std::span<const char> generated_ptx,
+                            std::span<const char> generated_cubin,
+                            const std::vector<MemoryInput>& ptx_inputs,
+                            const std::vector<MemoryInput>& cubin_inputs,
+                            const std::vector<MemoryInput>& ltoir_inputs,
+                            const CompilerOptions& config)
+  {
+    FatbinResult result;
+
+    const char* fatbin_options[] = {"-64", "-cuda"};
+    nvFatbinHandle fatbin_handle = nullptr;
+    nvFatbinResult fbr           = nvFatbinCreate(&fatbin_handle, fatbin_options, 2);
+    if (fbr != NVFATBIN_SUCCESS)
+    {
+      result.diagnostics += std::string("\nnvFatbinCreate failed: ") + nvFatbinGetErrorString(fbr);
+      return result;
+    }
+    auto destroy_fatbin_handle = llvm::scope_exit([&] {
+      nvFatbinDestroy(&fatbin_handle);
+    });
+
+    const std::string arch = std::to_string(config.sm_version);
+
+    if (!generated_cubin.empty())
+    {
+      fbr = nvFatbinAddCubin(fatbin_handle, generated_cubin.data(), generated_cubin.size(), arch.c_str(), "source.cubin");
+      if (fbr != NVFATBIN_SUCCESS)
+      {
+        result.diagnostics += std::string("\nnvFatbinAddCubin failed: ") + nvFatbinGetErrorString(fbr);
+        return result;
+      }
+    }
+
+    std::vector<std::vector<char>> ptx_storage;
+    ptx_storage.reserve((generated_ptx.empty() ? 0 : 1) + ptx_inputs.size());
+    auto add_ptx = [&](std::span<const char> ptx, const std::string& name) {
+      ptx_storage.emplace_back(ptx.begin(), ptx.end());
+      if (ptx_storage.back().empty() || ptx_storage.back().back() != '\0')
+      {
+        ptx_storage.back().push_back('\0');
+      }
+      fbr = nvFatbinAddPTX(
+        fatbin_handle, ptx_storage.back().data(), ptx_storage.back().size(), arch.c_str(), name.c_str(), nullptr);
+      if (fbr != NVFATBIN_SUCCESS)
+      {
+        result.diagnostics += std::string("\nnvFatbinAddPTX failed: ") + nvFatbinGetErrorString(fbr);
+        return false;
+      }
+      return true;
+    };
+
+    if (!generated_ptx.empty() && !add_ptx(generated_ptx, "source.ptx"))
+    {
+      return result;
+    }
+    for (const auto& input : ptx_inputs)
+    {
+      if (!add_ptx(input.data, input.generated_name))
+      {
+        return result;
+      }
+    }
+    for (const auto& input : cubin_inputs)
+    {
+      fbr = nvFatbinAddCubin(
+        fatbin_handle, input.data.data(), input.data.size(), arch.c_str(), input.generated_name.c_str());
+      if (fbr != NVFATBIN_SUCCESS)
+      {
+        result.diagnostics += std::string("\nnvFatbinAddCubin failed: ") + nvFatbinGetErrorString(fbr);
+        return result;
+      }
+    }
+    for (const auto& input : ltoir_inputs)
+    {
+      fbr = nvFatbinAddLTOIR(
+        fatbin_handle, input.data.data(), input.data.size(), arch.c_str(), input.generated_name.c_str(), nullptr);
+      if (fbr != NVFATBIN_SUCCESS)
+      {
+        result.diagnostics += std::string("\nnvFatbinAddLTOIR failed: ") + nvFatbinGetErrorString(fbr);
+        return result;
+      }
+    }
+
+    size_t fatbin_size = 0;
+    fbr                = nvFatbinSize(fatbin_handle, &fatbin_size);
+    if (fbr != NVFATBIN_SUCCESS || fatbin_size == 0)
+    {
+      result.diagnostics += std::string("\nnvFatbinSize failed: ") + nvFatbinGetErrorString(fbr);
+      return result;
+    }
+
+    result.fatbin.resize(fatbin_size);
+    fbr = nvFatbinGet(fatbin_handle, result.fatbin.data());
+    if (fbr != NVFATBIN_SUCCESS)
+    {
+      result.diagnostics += std::string("\nnvFatbinGet failed: ") + nvFatbinGetErrorString(fbr);
+      return result;
+    }
+
+    result.success = true;
+    return result;
+  }
+
+  bool compileHostCode(std::span<const char> source_code,
+                       const std::string& input_file,
+                       const std::string& fatbin_path,
+                       const std::string& output_obj,
+                       const CompilerOptions& config,
+                       std::string& diagnostics)
   {
     std::string temp_dir    = std::filesystem::path(output_obj).parent_path().string();
-    std::string source_file = temp_dir + "/host_" + input_file;
+    std::string source_file = (std::filesystem::path(temp_dir) / ("host_" + input_file)).string();
 
     std::vector<std::string> driver_arg_strings;
     appendCommonClangDriverArgs(driver_arg_strings, source_file, output_obj, config, /*is_device=*/false);
@@ -1645,7 +2408,7 @@ public:
     }
 
     clang::EmitObjAction emit_action;
-    bool success = runWithLargeStack([&] {
+    const bool success = runWithLargeStack([&] {
       return compiler.ExecuteAction(emit_action);
     });
 
@@ -1665,28 +2428,18 @@ public:
     return success;
   }
 
-  CompilationResult compileToObject(
-    const std::string& source_code,
-    const std::string& input_name,
-    const std::string& output_path,
-    const std::string& output_cubin_path,
-    const CompilerOptions& config)
+  CompilationResult compileToObject(std::span<const char> source_code,
+                                    const std::string& input_name,
+                                    const std::string& output_path,
+                                    const std::vector<MemoryInput>& device_ir_inputs,
+                                    const std::vector<MemoryInput>& ltoir_inputs,
+                                    const CompilerOptions& config)
   {
     CompilationResult result;
-    result.success          = false;
     result.object_file_path = output_path;
 
-    std::string error_msg;
-    if (!validateOptions(config, &error_msg))
-    {
-      result.diagnostics = "Configuration error: " + error_msg;
-      return result;
-    }
-
-    initialize_llvm();
-
     std::string temp_dir =
-      (tempDirectoryPath() / ("hostjit_" + std::to_string(reinterpret_cast<uintptr_t>(this)))).string();
+      (tempDirectoryPath() / ("cudacc_" + std::to_string(reinterpret_cast<uintptr_t>(this)))).string();
     if (!createDirectories(temp_dir, result.diagnostics))
     {
       return result;
@@ -1695,16 +2448,17 @@ public:
       removeAll(temp_dir);
     });
 
-    std::string input_file  = input_name.empty() ? std::string("input.cu") : input_name;
-    std::string ptx_file    = temp_dir + "/device.ptx";
-    std::string fatbin_file = temp_dir + "/device.fatbin";
+    const std::string input_file  = input_name.empty() ? std::string("input.cu") : input_name;
+    const std::string fatbin_file = (std::filesystem::path(temp_dir) / "device.fatbin").string();
 
     if (config.verbose)
     {
       result.diagnostics += "=== Device compilation ===\n";
     }
 
-    if (!compileDeviceToPTX(source_code, input_file, ptx_file, config, result.diagnostics))
+    auto ptx_result = compileToPTX(source_code, input_file, device_ir_inputs, config);
+    result.diagnostics += ptx_result.diagnostics;
+    if (!ptx_result)
     {
       result.diagnostics += "\nDevice compilation failed";
       return result;
@@ -1715,183 +2469,34 @@ public:
       result.diagnostics += "\n=== nvJitLink + fatbinary ===\n";
     }
 
+    auto cubin_result = linkToCubin(
+      std::span<const char>{ptx_result.ptx.data(), ptx_result.ptx.size()}, {}, {}, ltoir_inputs, config);
+    result.diagnostics += cubin_result.diagnostics;
+    if (!cubin_result)
     {
-      std::vector<char> ptx_data;
-      {
-        std::ifstream f(ptx_file, std::ios::binary);
-        ptx_data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-      }
-      if (ptx_data.empty())
-      {
-        result.diagnostics += "\nFailed to read ptx file";
-        return result;
-      }
-      if (ptx_data.back() != '\0')
-      {
-        ptx_data.push_back('\0');
-      }
+      return result;
+    }
 
-      std::string arch_opt  = "-arch=sm_" + std::to_string(config.sm_version);
-      std::string opt_level = "-O" + std::to_string(config.optimization_level >= 1 ? 3 : 0);
-      std::vector<std::string> jitlink_option_strs{arch_opt, opt_level};
-      // LTOIR inputs require -lto. When present, both the PTX and the LTOIRs
-      // get linked through the LTO codegen path.
-      const bool have_ltoir = !config.device_ltoir_files.empty();
-      if (have_ltoir)
-      {
-        jitlink_option_strs.emplace_back("-lto");
-      }
-      std::vector<const char*> jitlink_options;
-      jitlink_options.reserve(jitlink_option_strs.size());
-      for (const auto& s : jitlink_option_strs)
-      {
-        jitlink_options.push_back(s.c_str());
-      }
+    auto fatbin_result = createFatbin(
+      std::span<const char>{ptx_result.ptx.data(), ptx_result.ptx.size()},
+      std::span<const char>{cubin_result.cubin.data(), cubin_result.cubin.size()},
+      {},
+      {},
+      {},
+      config);
+    result.diagnostics += fatbin_result.diagnostics;
+    if (!fatbin_result)
+    {
+      return result;
+    }
 
-      nvJitLinkHandle jitlink_handle = nullptr;
-      nvJitLinkResult jlr =
-        nvJitLinkCreate(&jitlink_handle, static_cast<uint32_t>(jitlink_options.size()), jitlink_options.data());
-      if (jlr != NVJITLINK_SUCCESS)
-      {
-        result.diagnostics += "\nnvJitLinkCreate failed (error " + std::to_string(static_cast<int>(jlr)) + ")";
-        result.diagnostics += "\nnvJitLink options:";
-        for (const auto& option : jitlink_option_strs)
-        {
-          result.diagnostics += " " + option;
-        }
-        return result;
-      }
-      auto destroy_jitlink_handle = llvm::scope_exit([&] {
-        nvJitLinkDestroy(&jitlink_handle);
-      });
-
-      jlr = nvJitLinkAddData(jitlink_handle, NVJITLINK_INPUT_PTX, ptx_data.data(), ptx_data.size(), "device.ptx");
-      if (jlr != NVJITLINK_SUCCESS)
-      {
-        size_t log_size = 0;
-        nvJitLinkGetErrorLogSize(jitlink_handle, &log_size);
-        if (log_size > 1)
-        {
-          std::string log(log_size, '\0');
-          nvJitLinkGetErrorLog(jitlink_handle, log.data());
-          result.diagnostics += "\n" + log;
-        }
-        result.diagnostics += "\nnvJitLinkAddData failed";
-        return result;
-      }
-
-      // Feed LTO-IR inputs to nvJitLink alongside the device PTX. This is the
-      // escape-hatch path for callers with pre-built nvcc -dlto artifacts;
-      // Python-emitted user ops travel as LLVM bitcode through the path above
-      // and are already inlined into the PTX by the time we get here.
-      // nvJitLink resolves any remaining extern symbol(s) from these modules.
-      for (const auto& ltoir_path : config.device_ltoir_files)
-      {
-        std::ifstream f(ltoir_path, std::ios::binary);
-        std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-        if (buf.empty())
-        {
-          continue;
-        }
-        jlr = nvJitLinkAddData(jitlink_handle, NVJITLINK_INPUT_LTOIR, buf.data(), buf.size(), ltoir_path.c_str());
-        if (jlr != NVJITLINK_SUCCESS)
-        {
-          size_t log_size = 0;
-          nvJitLinkGetErrorLogSize(jitlink_handle, &log_size);
-          if (log_size > 1)
-          {
-            std::string log(log_size, '\0');
-            nvJitLinkGetErrorLog(jitlink_handle, log.data());
-            result.diagnostics += "\n" + log;
-          }
-          result.diagnostics += "\nnvJitLinkAddData(LTOIR) failed for " + ltoir_path;
-          return result;
-        }
-      }
-
-      jlr = nvJitLinkComplete(jitlink_handle);
-      if (jlr != NVJITLINK_SUCCESS)
-      {
-        size_t log_size = 0;
-        nvJitLinkGetErrorLogSize(jitlink_handle, &log_size);
-        if (log_size > 1)
-        {
-          std::string log(log_size, '\0');
-          nvJitLinkGetErrorLog(jitlink_handle, log.data());
-          result.diagnostics += "\n" + log;
-        }
-        result.diagnostics += "\nnvJitLinkComplete failed";
-        return result;
-      }
-
-      size_t cubin_size = 0;
-      nvJitLinkGetLinkedCubinSize(jitlink_handle, &cubin_size);
-      std::vector<char> cubin_data(cubin_size);
-      nvJitLinkGetLinkedCubin(jitlink_handle, cubin_data.data());
-
-      if (!output_cubin_path.empty())
-      {
-        if (!writeFile(
-              output_cubin_path,
-              llvm::ArrayRef<char>{cubin_data.data(), cubin_data.size()},
-              result.diagnostics,
-              "\nFailed to write cubin file"))
-        {
-          return result;
-        }
-      }
-
-      std::string arch             = std::to_string(config.sm_version);
-      const char* fatbin_options[] = {"-64", "-cuda"};
-      nvFatbinHandle fatbin_handle = nullptr;
-      nvFatbinResult fbr           = nvFatbinCreate(&fatbin_handle, fatbin_options, 2);
-      if (fbr != NVFATBIN_SUCCESS)
-      {
-        result.diagnostics += std::string("\nnvFatbinCreate failed: ") + nvFatbinGetErrorString(fbr);
-        return result;
-      }
-      auto destroy_fatbin_handle = llvm::scope_exit([&] {
-        nvFatbinDestroy(&fatbin_handle);
-      });
-
-      fbr = nvFatbinAddCubin(fatbin_handle, cubin_data.data(), cubin_data.size(), arch.c_str(), "device.cubin");
-      if (fbr != NVFATBIN_SUCCESS)
-      {
-        result.diagnostics += std::string("\nnvFatbinAddCubin failed: ") + nvFatbinGetErrorString(fbr);
-        return result;
-      }
-
-      fbr = nvFatbinAddPTX(fatbin_handle, ptx_data.data(), ptx_data.size(), arch.c_str(), "device.ptx", nullptr);
-      if (fbr != NVFATBIN_SUCCESS)
-      {
-        result.diagnostics += std::string("\nnvFatbinAddPTX failed: ") + nvFatbinGetErrorString(fbr);
-        return result;
-      }
-
-      size_t fatbin_size = 0;
-      fbr                = nvFatbinSize(fatbin_handle, &fatbin_size);
-      if (fbr != NVFATBIN_SUCCESS)
-      {
-        result.diagnostics += std::string("\nnvFatbinSize failed: ") + nvFatbinGetErrorString(fbr);
-        return result;
-      }
-
-      std::vector<char> fatbin_data(fatbin_size);
-      fbr = nvFatbinGet(fatbin_handle, fatbin_data.data());
-      if (fbr != NVFATBIN_SUCCESS)
-      {
-        result.diagnostics += std::string("\nnvFatbinGet failed: ") + nvFatbinGetErrorString(fbr);
-        return result;
-      }
-
-      if (!writeFile(
-            fatbin_file,
-            llvm::ArrayRef<char>{fatbin_data.data(), fatbin_data.size()},
-            result.diagnostics,
-            "\nFailed to write fatbin file"))
-      {
-        return result;
-      }
+    if (!writeFile(
+          fatbin_file,
+          std::span<const char>{fatbin_result.fatbin.data(), fatbin_result.fatbin.size()},
+          result.diagnostics,
+          "\nFailed to write fatbin file"))
+    {
+      return result;
     }
 
     if (config.verbose)
@@ -1909,53 +2514,37 @@ public:
     {
       cleanup_temp_dir.release();
     }
+    result.cubin   = std::move(cubin_result.cubin);
     result.success = true;
     return result;
   }
 
-  bool createPCH(const std::string& source_code,
-                 cudaccPCHKind kind,
+  bool createPCH(std::span<const char> source_code,
+                 bool is_device,
                  const std::string& pch_source_path,
                  const std::string& pch_output_path,
                  const CompilerOptions& config,
                  std::string& diagnostics)
   {
-    std::string error_msg;
-    if (!validateOptions(config, &error_msg))
-    {
-      diagnostics = "Configuration error: " + error_msg;
-      return false;
-    }
-
-    if (kind != CUDACC_PCH_DEVICE && kind != CUDACC_PCH_HOST)
-    {
-      diagnostics = "Invalid PCH kind";
-      return false;
-    }
-
-    initialize_llvm();
-
     std::vector<std::string> arg_strings;
-    appendCommonClangDriverArgs(
-      arg_strings, pch_source_path, pch_output_path, config, /*is_device=*/kind == CUDACC_PCH_DEVICE);
+    appendCommonClangDriverArgs(arg_strings, pch_source_path, pch_output_path, config, is_device);
     return generatePCH(
       source_code,
       pch_source_path,
       pch_output_path,
       std::move(arg_strings),
       config,
-      kind == CUDACC_PCH_DEVICE ? "Device PCH" : "Host PCH",
+      is_device ? "Device PCH" : "Host PCH",
       diagnostics);
   }
 
   LinkResult linkToSharedLibrary(
-    const std::vector<std::string>& object_files, const std::string& output_path, const CompilerOptions& config)
+    const std::vector<std::string>& input_files, const std::string& output_path, const CompilerOptions& config)
   {
     LinkResult result;
-    result.success      = false;
     result.library_path = output_path;
 
-    if (object_files.empty())
+    if (input_files.empty())
     {
       result.diagnostics = "No object files provided";
       return result;
@@ -1970,8 +2559,6 @@ public:
     arg_strings.push_back("/NODEFAULTLIB");
     arg_strings.push_back("/OUT:" + output_path);
 
-    // Generate import libraries from DLLs present on the system,
-    // so we don't require the Windows SDK or MSVC .lib files.
     std::string implib_dir = std::filesystem::path(output_path).parent_path().string();
 
     std::string cudart_dll = findCudartDllName(config.cuda_toolkit_path);
@@ -2081,9 +2668,9 @@ public:
 
     arg_strings.push_back("/LIBPATH:" + implib_dir);
 
-    for (const auto& obj_file : object_files)
+    for (const auto& input_file : input_files)
     {
-      arg_strings.push_back(obj_file);
+      arg_strings.push_back(input_file);
     }
 
     arg_strings.push_back("cudart.lib");
@@ -2095,10 +2682,6 @@ public:
     arg_strings.push_back("-shared");
     arg_strings.push_back("--build-id");
     arg_strings.push_back("--eh-frame-hdr");
-    // Allow unresolved symbols — they will be satisfied at dlopen() time
-    // by libraries already loaded in the host process (libc, libstdc++,
-    // cudart, etc.).  This removes the need for system CRT objects and
-    // dev packages on the target machine.
     arg_strings.push_back("--allow-shlib-undefined");
     arg_strings.push_back("-o");
     arg_strings.push_back(output_path);
@@ -2106,19 +2689,15 @@ public:
     for (const auto& lib_path : config.library_paths)
     {
       arg_strings.push_back("-L" + lib_path);
-      // Embed the library path as RPATH so the dynamic linker can find
-      // libcudart.so.XX at dlopen time without LD_LIBRARY_PATH.
       arg_strings.push_back("-rpath");
       arg_strings.push_back(lib_path);
     }
 
-    for (const auto& obj_file : object_files)
+    for (const auto& input_file : input_files)
     {
-      arg_strings.push_back(obj_file);
+      arg_strings.push_back(input_file);
     }
 
-    // pip packages ship libcudart.so.XX without an unversioned symlink,
-    // so -lcudart won't work.  Find the actual .so by scanning library_paths.
     {
       bool found_cudart = false;
       for (const auto& lib_path : config.library_paths)
@@ -2187,34 +2766,62 @@ public:
 };
 } // namespace cudacc
 
-struct cudaccProgram_st
-{
-  std::string source;
-  std::string name;
-  std::string log;
-  cudacc::CompilerImpl compiler;
-};
-
 namespace
 {
-void setProgramLog(cudaccProgram prog, std::string log)
+void initOutput(cudaccOutput& output)
 {
-  if (prog)
-  {
-    prog->log = std::move(log);
-  }
+  output.output_data      = nullptr;
+  output.output_size      = 0;
+  output.program_log      = nullptr;
+  output.program_log_size = 0;
 }
 
-bool parseProgramOptions(
-  cudaccProgram prog, int num_options, const char* const* raw_options, cudacc::CompilerOptions& options)
+void freeOutput(cudaccOutput& output)
 {
-  std::string error;
-  if (!cudacc::parseOptions(num_options, raw_options, options, error))
+  delete[] const_cast<char*>(output.output_data);
+  delete[] const_cast<char*>(output.program_log);
+  initOutput(output);
+}
+
+void setOutputLog(cudaccOutput& output, std::string_view log)
+{
+  delete[] const_cast<char*>(output.program_log);
+  auto* data = new char[log.size() + 1];
+  if (!log.empty())
   {
-    setProgramLog(prog, "Option error: " + error);
-    return false;
+    std::memcpy(data, log.data(), log.size());
   }
-  return true;
+  data[log.size()]       = '\0';
+  output.program_log      = data;
+  output.program_log_size = log.size();
+}
+
+void setOutputData(cudaccOutput& output, std::span<const char> data)
+{
+  delete[] const_cast<char*>(output.output_data);
+  output.output_data = nullptr;
+  output.output_size = 0;
+  if (data.empty())
+  {
+    return;
+  }
+
+  auto* buffer = new char[data.size()];
+  std::memcpy(buffer, data.data(), data.size());
+  output.output_data = buffer;
+  output.output_size = data.size();
+}
+
+cudaccResult finishCompile(cudaccOutput& output, cudaccResult result, std::string_view diagnostics)
+{
+  if (result != CUDACC_SUCCESS)
+  {
+    delete[] const_cast<char*>(output.output_data);
+    output.output_data = nullptr;
+    output.output_size = 0;
+  }
+  setOutputLog(output, diagnostics);
+  return result;
 }
 } // anonymous namespace
 
@@ -2224,14 +2831,8 @@ extern "C" const char* cudaccGetErrorString(cudaccResult result)
   {
     case CUDACC_SUCCESS:
       return "CUDACC_SUCCESS";
-    case CUDACC_ERROR_OUT_OF_MEMORY:
-      return "CUDACC_ERROR_OUT_OF_MEMORY";
-    case CUDACC_ERROR_PROGRAM_CREATION_FAILURE:
-      return "CUDACC_ERROR_PROGRAM_CREATION_FAILURE";
     case CUDACC_ERROR_INVALID_INPUT:
       return "CUDACC_ERROR_INVALID_INPUT";
-    case CUDACC_ERROR_INVALID_PROGRAM:
-      return "CUDACC_ERROR_INVALID_PROGRAM";
     case CUDACC_ERROR_INVALID_OPTION:
       return "CUDACC_ERROR_INVALID_OPTION";
     case CUDACC_ERROR_COMPILATION:
@@ -2246,181 +2847,178 @@ extern "C" const char* cudaccGetErrorString(cudaccResult result)
   return "CUDACC_ERROR_UNKNOWN";
 }
 
-extern "C" cudaccResult cudaccCreateProgram(cudaccProgram* prog, const char* src, const char* name)
+extern "C" cudaccResult cudaccDestroyOutput(cudaccOutput* output)
 {
-  if (!prog || !src)
-  {
-    return CUDACC_ERROR_INVALID_INPUT;
-  }
-  *prog = nullptr;
-
-  auto* program   = new cudaccProgram_st;
-  program->source = src;
-  program->name   = (name && name[0]) ? name : "input.cu";
-  *prog           = program;
-  return CUDACC_SUCCESS;
-}
-
-extern "C" cudaccResult cudaccDestroyProgram(cudaccProgram* prog)
-{
-  if (!prog || !*prog)
+  if (!output)
   {
     return CUDACC_SUCCESS;
   }
-  delete *prog;
-  *prog = nullptr;
+  freeOutput(*output);
   return CUDACC_SUCCESS;
 }
 
-extern "C" cudaccResult cudaccCompileProgramToDeviceBitcode(
-  cudaccProgram prog, const char* outputBitcodePath, int numOptions, const char* const* options)
+extern "C" cudaccResult cudaccCompile(cudaccOutput* output, const char** options, size_t num_options)
 {
-  if (!prog)
+  if (!output)
   {
-    return CUDACC_ERROR_INVALID_PROGRAM;
-  }
-  if (!outputBitcodePath || outputBitcodePath[0] == '\0')
-  {
-    setProgramLog(prog, "outputBitcodePath must be non-empty");
     return CUDACC_ERROR_INVALID_INPUT;
   }
 
-  cudacc::CompilerOptions parsed_options;
-  if (!parseProgramOptions(prog, numOptions, options, parsed_options))
-  {
-    return CUDACC_ERROR_INVALID_OPTION;
-  }
+  initOutput(*output);
 
-  auto result = prog->compiler.compileToDeviceBitcode(prog->source, prog->name, outputBitcodePath, parsed_options);
-  setProgramLog(prog, result.diagnostics);
-  return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_COMPILATION;
-}
-
-extern "C" cudaccResult cudaccCompileProgramToObject(
-  cudaccProgram prog,
-  const char* outputObjectPath,
-  const char* outputCubinPath,
-  int numOptions,
-  const char* const* options)
-{
-  if (!prog)
-  {
-    return CUDACC_ERROR_INVALID_PROGRAM;
-  }
-  if (!outputObjectPath || outputObjectPath[0] == '\0')
-  {
-    setProgramLog(prog, "outputObjectPath must be non-empty");
-    return CUDACC_ERROR_INVALID_INPUT;
-  }
-
-  cudacc::CompilerOptions parsed_options;
-  if (!parseProgramOptions(prog, numOptions, options, parsed_options))
-  {
-    return CUDACC_ERROR_INVALID_OPTION;
-  }
-
-  const std::string cubin_path = outputCubinPath ? outputCubinPath : "";
-  auto result = prog->compiler.compileToObject(prog->source, prog->name, outputObjectPath, cubin_path, parsed_options);
-  setProgramLog(prog, result.diagnostics);
-  return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_COMPILATION;
-}
-
-extern "C" cudaccResult cudaccLinkToSharedLibrary(
-  cudaccProgram prog,
-  int numObjectFiles,
-  const char* const* objectFiles,
-  const char* outputLibraryPath,
-  int numOptions,
-  const char* const* options)
-{
-  if (!prog)
-  {
-    return CUDACC_ERROR_INVALID_PROGRAM;
-  }
-  if (numObjectFiles < 0 || (numObjectFiles > 0 && !objectFiles) || !outputLibraryPath || outputLibraryPath[0] == '\0')
-  {
-    setProgramLog(prog, "Invalid link input");
-    return CUDACC_ERROR_INVALID_INPUT;
-  }
-
-  cudacc::CompilerOptions parsed_options;
-  if (!parseProgramOptions(prog, numOptions, options, parsed_options))
-  {
-    return CUDACC_ERROR_INVALID_OPTION;
-  }
-
-  std::vector<std::string> object_files;
-  object_files.reserve(static_cast<size_t>(numObjectFiles));
-  for (int i = 0; i < numObjectFiles; ++i)
-  {
-    if (!objectFiles[i] || objectFiles[i][0] == '\0')
-    {
-      setProgramLog(prog, "Object file path must be non-empty");
-      return CUDACC_ERROR_INVALID_INPUT;
-    }
-    object_files.emplace_back(objectFiles[i]);
-  }
-
-  auto result = prog->compiler.linkToSharedLibrary(object_files, outputLibraryPath, parsed_options);
-  setProgramLog(prog, result.diagnostics);
-  return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_LINKING;
-}
-
-extern "C" cudaccResult cudaccCreatePCH(
-  cudaccProgram prog,
-  cudaccPCHKind kind,
-  const char* pchSourcePath,
-  const char* pchOutputPath,
-  int numOptions,
-  const char* const* options)
-{
-  if (!prog)
-  {
-    return CUDACC_ERROR_INVALID_PROGRAM;
-  }
-  if (!pchSourcePath || pchSourcePath[0] == '\0' || !pchOutputPath || pchOutputPath[0] == '\0')
-  {
-    setProgramLog(prog, "PCH source and output paths must be non-empty");
-    return CUDACC_ERROR_INVALID_INPUT;
-  }
-
-  cudacc::CompilerOptions parsed_options;
-  if (!parseProgramOptions(prog, numOptions, options, parsed_options))
-  {
-    return CUDACC_ERROR_INVALID_OPTION;
-  }
-
+  cudacc::CompileRequest request;
   std::string diagnostics;
-  bool success =
-    prog->compiler.createPCH(prog->source, kind, pchSourcePath, pchOutputPath, parsed_options, diagnostics);
-  setProgramLog(prog, diagnostics);
-  return success ? CUDACC_SUCCESS : CUDACC_ERROR_PCH_CREATE;
-}
+  if (!cudacc::parseOptions(num_options, options, request, diagnostics))
+  {
+    return finishCompile(*output, CUDACC_ERROR_INVALID_OPTION, "Option error: " + diagnostics);
+  }
 
-extern "C" cudaccResult cudaccGetProgramLogSize(cudaccProgram prog, size_t* logSizeRet)
-{
-  if (!prog)
+  cudaccResult validation_result = CUDACC_ERROR_INVALID_INPUT;
+  if (!cudacc::validateCompileRequest(request, diagnostics, validation_result))
   {
-    return CUDACC_ERROR_INVALID_PROGRAM;
+    return finishCompile(*output, validation_result, diagnostics);
   }
-  if (!logSizeRet)
-  {
-    return CUDACC_ERROR_INVALID_INPUT;
-  }
-  *logSizeRet = prog->log.size() + 1;
-  return CUDACC_SUCCESS;
-}
 
-extern "C" cudaccResult cudaccGetProgramLog(cudaccProgram prog, char* log)
-{
-  if (!prog)
+  cudacc::initialize_llvm();
+  cudacc::CompilerImpl compiler;
+
+  switch (request.output_kind)
   {
-    return CUDACC_ERROR_INVALID_PROGRAM;
+    case cudacc::OutputKind::device_ir:
+    {
+      auto result = compiler.compileToDeviceBitcode(request.source, request.source_name, request.config);
+      diagnostics += result.diagnostics;
+      if (!result)
+      {
+        return finishCompile(*output, CUDACC_ERROR_COMPILATION, diagnostics);
+      }
+      setOutputData(*output, std::span<const char>{result.bitcode.data(), result.bitcode.size()});
+      return finishCompile(*output, CUDACC_SUCCESS, diagnostics);
+    }
+
+    case cudacc::OutputKind::ptx:
+    {
+      auto result = compiler.compileToPTX(request.source, request.source_name, request.device_ir_inputs, request.config);
+      diagnostics += result.diagnostics;
+      if (!result)
+      {
+        return finishCompile(*output, CUDACC_ERROR_COMPILATION, diagnostics);
+      }
+      setOutputData(*output, std::span<const char>{result.ptx.data(), result.ptx.size()});
+      return finishCompile(*output, CUDACC_SUCCESS, diagnostics);
+    }
+
+    case cudacc::OutputKind::cubin:
+    {
+      std::vector<char> generated_ptx;
+      if (request.has_source)
+      {
+        auto ptx_result = compiler.compileToPTX(request.source, request.source_name, request.device_ir_inputs, request.config);
+        diagnostics += ptx_result.diagnostics;
+        if (!ptx_result)
+        {
+          return finishCompile(*output, CUDACC_ERROR_COMPILATION, diagnostics);
+        }
+        generated_ptx = std::move(ptx_result.ptx);
+      }
+
+      auto result = compiler.linkToCubin(
+        std::span<const char>{generated_ptx.data(), generated_ptx.size()},
+        request.ptx_inputs,
+        request.cubin_inputs,
+        request.ltoir_inputs,
+        request.config);
+      diagnostics += result.diagnostics;
+      if (!result)
+      {
+        return finishCompile(*output, CUDACC_ERROR_COMPILATION, diagnostics);
+      }
+      setOutputData(*output, std::span<const char>{result.cubin.data(), result.cubin.size()});
+      return finishCompile(*output, CUDACC_SUCCESS, diagnostics);
+    }
+
+    case cudacc::OutputKind::fatbin:
+    {
+      std::vector<char> generated_ptx;
+      std::vector<char> generated_cubin;
+      if (request.has_source)
+      {
+        auto ptx_result = compiler.compileToPTX(request.source, request.source_name, request.device_ir_inputs, request.config);
+        diagnostics += ptx_result.diagnostics;
+        if (!ptx_result)
+        {
+          return finishCompile(*output, CUDACC_ERROR_COMPILATION, diagnostics);
+        }
+        generated_ptx = std::move(ptx_result.ptx);
+
+        auto cubin_result = compiler.linkToCubin(
+          std::span<const char>{generated_ptx.data(), generated_ptx.size()}, {}, {}, request.ltoir_inputs, request.config);
+        diagnostics += cubin_result.diagnostics;
+        if (!cubin_result)
+        {
+          return finishCompile(*output, CUDACC_ERROR_COMPILATION, diagnostics);
+        }
+        generated_cubin = std::move(cubin_result.cubin);
+      }
+
+      auto result = compiler.createFatbin(
+        std::span<const char>{generated_ptx.data(), generated_ptx.size()},
+        std::span<const char>{generated_cubin.data(), generated_cubin.size()},
+        request.ptx_inputs,
+        request.cubin_inputs,
+        request.ltoir_inputs,
+        request.config);
+      diagnostics += result.diagnostics;
+      if (!result)
+      {
+        return finishCompile(*output, CUDACC_ERROR_INTERNAL_ERROR, diagnostics);
+      }
+      setOutputData(*output, std::span<const char>{result.fatbin.data(), result.fatbin.size()});
+      return finishCompile(*output, CUDACC_SUCCESS, diagnostics);
+    }
+
+    case cudacc::OutputKind::create_device_pch:
+    case cudacc::OutputKind::create_host_pch:
+    {
+      const bool is_device = request.output_kind == cudacc::OutputKind::create_device_pch;
+      const bool success   = compiler.createPCH(
+        request.source,
+        is_device,
+        request.pch_source_path,
+        request.output_path,
+        request.config,
+        diagnostics);
+      return finishCompile(*output, success ? CUDACC_SUCCESS : CUDACC_ERROR_PCH_CREATE, diagnostics);
+    }
+
+    case cudacc::OutputKind::compile:
+    {
+      auto result = compiler.compileToObject(
+        request.source,
+        request.source_name,
+        request.output_path,
+        request.device_ir_inputs,
+        request.ltoir_inputs,
+        request.config);
+      diagnostics += result.diagnostics;
+      if (!result)
+      {
+        return finishCompile(*output, CUDACC_ERROR_COMPILATION, diagnostics);
+      }
+      setOutputData(*output, std::span<const char>{result.cubin.data(), result.cubin.size()});
+      return finishCompile(*output, CUDACC_SUCCESS, diagnostics);
+    }
+
+    case cudacc::OutputKind::shared:
+    {
+      auto result = compiler.linkToSharedLibrary(request.link_input_paths, request.output_path, request.config);
+      diagnostics += result.diagnostics;
+      return finishCompile(*output, result ? CUDACC_SUCCESS : CUDACC_ERROR_LINKING, diagnostics);
+    }
+
+    case cudacc::OutputKind::none:
+      break;
   }
-  if (!log)
-  {
-    return CUDACC_ERROR_INVALID_INPUT;
-  }
-  std::memcpy(log, prog->log.c_str(), prog->log.size() + 1);
-  return CUDACC_SUCCESS;
+
+  return finishCompile(*output, CUDACC_ERROR_INTERNAL_ERROR, "Unhandled output kind");
 }

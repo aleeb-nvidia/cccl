@@ -102,31 +102,29 @@ bool BitcodeCollector::compile_and_add(const char* source, size_t source_size, c
     return true;
   }
 
-  std::string src(source, source_size);
   auto path = make_temp_path("cccl_" + name + "_", unique_id_, ".bc");
 
-  std::vector<std::string> options;
-  config_.appendCommandLineArguments(options);
-  auto option_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
+  std::vector<std::string> base_options;
+  config_.appendCommandLineArguments(base_options);
 
-  hostjit::detail::CudaccProgramGuard program;
-  auto create_result = cudaccCreateProgram(&program.program, src.c_str(), "input.cu");
-  if (create_result != CUDACC_SUCCESS)
-  {
-    fprintf(stderr, "\nERROR creating cudacc program for %s: %s\n", name.c_str(), cudaccGetErrorString(create_result));
-    return false;
-  }
+  hostjit::detail::CudaccOptionsBuilder options;
+  options.add_all(base_options);
+  options.add("--device-ir");
+  options.add("--source-name=input.cu");
+  options.add_memory_input("--input-source", std::span<const char>{source, source_size});
+  auto option_ptrs = options.argv();
 
-  auto result = cudaccCompileProgramToDeviceBitcode(
-    program.program, path.c_str(), static_cast<int>(option_ptrs.size()), option_ptrs.data());
+  hostjit::detail::CudaccOutputGuard output;
+  auto result = cudaccCompile(&output.output, option_ptrs.empty() ? nullptr : option_ptrs.data(), option_ptrs.size());
   if (result != CUDACC_SUCCESS)
   {
-    auto log = hostjit::detail::get_cudacc_program_log(program.program);
+    auto log = hostjit::detail::get_cudacc_output_log(output.output);
     fprintf(stderr, "\nERROR compiling %s to bitcode: %s\n", name.c_str(), log.c_str());
     return false;
   }
 
-  if (std::filesystem::exists(path))
+  if (output.output.output_data && output.output.output_size > 0
+      && write_file(output.output.output_data, output.output.output_size, path))
   {
     config_.device_bitcode_files.push_back(path);
     temp_paths_.push_back(path);
