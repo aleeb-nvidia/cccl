@@ -1,0 +1,9 @@
+[
+  {
+    "name": "unstable",
+    "version": "unstable",
+    "url": "https://aleeb-nvidia.github.io/cccl/unstable/",
+    "latest": true,
+    "preferred": true
+  }
+]
